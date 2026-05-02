@@ -1,0 +1,42 @@
+{
+  "name": "agent-bridge",
+  "displayName": "Agent Bridge (marimo)",
+  "description": "Localhost HTTP bridge so external agents can drive marimo notebooks via vscode.commands.executeCommand.",
+  "publisher": "hugolytics",
+  "version": "0.1.0",
+  "engines": {
+    "vscode": "^1.86.0"
+  },
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "configuration": {
+      "title": "Agent Bridge",
+      "properties": {
+        "agentBridge.port": {
+          "type": "number",
+          "default": 0,
+          "description": "Port for the bridge HTTP server. 0 = auto-pick (port written to ~/.agent-bridge.json)."
+        },
+        "agentBridge.token": {
+          "type": "string",
+          "default": "",
+          "description": "Optional bearer token. If empty, no auth (localhost-only). Set for shared dev machines."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "esbuild --format=cjs --platform=node --target=node20 --bundle --external:vscode --minify src/extension.ts --outfile=dist/extension.js",
+    "package": "vsce package --no-dependencies --skip-license --out /tmp/agent-bridge.vsix"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "@types/vscode": "^1.86.0",
+    "@vscode/vsce": "^3.9.1",
+    "esbuild": "^0.21.0",
+    "typescript": "^5.4.0"
+  }
+}
