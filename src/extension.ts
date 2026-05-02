@@ -251,15 +251,18 @@ async function handle(
     return;
   }
 
-  // ---- Notebook cell mutation (provider-agnostic; works for any notebook
-  // type supported by VS Code's notebook API, not just marimo). All endpoints
-  // take ?notebook=<uri> and route through `vscode.workspace.applyEdit` +
-  // `NotebookEdit`, the API VS Code itself uses internally for Run/Edit.
-
-  if (req.method === "GET" && url.pathname === "/notebooks/cells") {
-    const nbUri = url.searchParams.get("notebook");
+  // ---- Notebook cell mutation -------------------------------------------
+  // All four endpoints share the same pattern: locate the notebook (by ?notebook=
+  // or body.notebookUri), validate the cell index if the URL has one, then run
+  // a small handler. Single dispatch table keeps validation in one place
+  // (audit found PATCH-with-no-code wiped cells + run-out-of-bounds was
+  // silently OK; both fixed by the shared validator).
+  const cellRoute = matchCellRoute(req.method ?? "", url.pathname);
+  if (cellRoute) {
+    const body = await readJson(req).catch(() => ({}));
+    const nbUri = url.searchParams.get("notebook") ?? body?.notebookUri;
     if (!nbUri) {
-      writeJson(res, 400, { ok: false, error: "missing ?notebook=<uri>" });
+      writeJson(res, 400, { ok: false, error: "missing ?notebook=<uri> or body.notebookUri" });
       return;
     }
     const nb = vscode.workspace.notebookDocuments.find(
@@ -269,123 +272,21 @@ async function handle(
       writeJson(res, 404, {
         ok: false,
         error: `notebook not open: ${nbUri}`,
-        openNotebooks: vscode.workspace.notebookDocuments.map((n) =>
-          n.uri.toString(),
-        ),
+        openNotebooks: vscode.workspace.notebookDocuments.map((n) => n.uri.toString()),
       });
       return;
     }
-    const cells = nb.getCells().map((c, i) => ({
-      index: i,
-      kind: c.kind === vscode.NotebookCellKind.Code ? "code" : "markup",
-      languageId: c.document.languageId,
-      code: c.document.getText(),
-      executionSummary: c.executionSummary
-        ? {
-            success: c.executionSummary.success,
-            executionOrder: c.executionSummary.executionOrder,
-          }
-        : null,
-      outputs: c.outputs.map((o) => ({
-        items: o.items.map((it) => ({
-          mime: it.mime,
-          text: textDecodeSafe(it.data),
-        })),
-      })),
-    }));
-    writeJson(res, 200, { ok: true, result: { cells } });
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname === "/notebooks/cells") {
-    // Create cell.
-    // body: { notebookUri: string, code: string, languageId?: string,
-    //         kind?: "code"|"markup", index?: number (default = end) }
-    const body = await readJson(req);
-    const nb = vscode.workspace.notebookDocuments.find(
-      (n) => n.uri.toString() === body.notebookUri,
-    );
-    if (!nb) {
-      writeJson(res, 404, { ok: false, error: `notebook not open: ${body.notebookUri}` });
+    if (
+      cellRoute.cellIdx !== undefined &&
+      (cellRoute.cellIdx < 0 || cellRoute.cellIdx >= nb.cellCount)
+    ) {
+      writeJson(res, 404, {
+        ok: false,
+        error: `cell index ${cellRoute.cellIdx} out of bounds (cellCount=${nb.cellCount})`,
+      });
       return;
     }
-    const kind =
-      body.kind === "markup"
-        ? vscode.NotebookCellKind.Markup
-        : vscode.NotebookCellKind.Code;
-    // Default code cell language to "mo-python" (marimo's custom Python id)
-    // when the target notebook is marimo's. Without this, cells get
-    // languageId="python" which marimo's NotebookController doesn't own —
-    // they appear in the notebook but never execute.
-    const isMarimoNotebook = nb.notebookType === "marimo-notebook";
-    const lang =
-      body.languageId ??
-      (kind === vscode.NotebookCellKind.Code
-        ? isMarimoNotebook
-          ? "mo-python"
-          : "python"
-        : "markdown");
-    const cellData = new vscode.NotebookCellData(kind, body.code, lang);
-    const idx = typeof body.index === "number" ? body.index : nb.cellCount;
-    const edit = new vscode.WorkspaceEdit();
-    edit.set(nb.uri, [
-      vscode.NotebookEdit.insertCells(idx, [cellData]),
-    ]);
-    const ok = await vscode.workspace.applyEdit(edit);
-    writeJson(res, 200, { ok, result: { index: idx, cellCount: nb.cellCount } });
-    return;
-  }
-
-  // PATCH /notebooks/cells/{index}?notebook=<uri>  body: { code }
-  const editMatch = url.pathname.match(/^\/notebooks\/cells\/(\d+)$/);
-  if (req.method === "PATCH" && editMatch) {
-    const nbUri = url.searchParams.get("notebook");
-    const cellIdx = parseInt(editMatch[1], 10);
-    const body = await readJson(req);
-    if (!nbUri) {
-      writeJson(res, 400, { ok: false, error: "missing ?notebook=<uri>" });
-      return;
-    }
-    const nb = vscode.workspace.notebookDocuments.find(
-      (n) => n.uri.toString() === nbUri,
-    );
-    if (!nb || cellIdx < 0 || cellIdx >= nb.cellCount) {
-      writeJson(res, 404, { ok: false, error: "notebook or cell not found" });
-      return;
-    }
-    const cell = nb.cellAt(cellIdx);
-    const range = new vscode.Range(
-      cell.document.positionAt(0),
-      cell.document.positionAt(cell.document.getText().length),
-    );
-    const edit = new vscode.WorkspaceEdit();
-    edit.replace(cell.document.uri, range, body.code ?? "");
-    const ok = await vscode.workspace.applyEdit(edit);
-    writeJson(res, 200, { ok, result: { index: cellIdx } });
-    return;
-  }
-
-  // POST /notebooks/cells/{index}/run?notebook=<uri>
-  const runMatch = url.pathname.match(/^\/notebooks\/cells\/(\d+)\/run$/);
-  if (req.method === "POST" && runMatch) {
-    const nbUri = url.searchParams.get("notebook");
-    const cellIdx = parseInt(runMatch[1], 10);
-    if (!nbUri) {
-      writeJson(res, 400, { ok: false, error: "missing ?notebook=<uri>" });
-      return;
-    }
-    const nb = vscode.workspace.notebookDocuments.find(
-      (n) => n.uri.toString() === nbUri,
-    );
-    if (!nb) {
-      writeJson(res, 404, { ok: false, error: "notebook not open" });
-      return;
-    }
-    await vscode.commands.executeCommand("notebook.cell.execute", {
-      ranges: [{ start: cellIdx, end: cellIdx + 1 }],
-      document: nb.uri,
-    });
-    writeJson(res, 200, { ok: true, result: { queued: cellIdx } });
+    await cellRoute.handler({ nb, body, cellIdx: cellRoute.cellIdx, res });
     return;
   }
 
@@ -406,6 +307,97 @@ function writeJson(res: http.ServerResponse, status: number, payload: unknown): 
   res.statusCode = status;
   res.setHeader("content-type", "application/json");
   res.end(JSON.stringify(payload));
+}
+
+interface CellRouteCtx {
+  nb: vscode.NotebookDocument;
+  body: any;
+  cellIdx: number | undefined;
+  res: http.ServerResponse;
+}
+
+interface CellRoute {
+  cellIdx?: number;
+  handler: (ctx: CellRouteCtx) => Promise<void>;
+}
+
+function matchCellRoute(method: string, pathname: string): CellRoute | null {
+  if (method === "GET" && pathname === "/notebooks/cells") return { handler: listCells };
+  if (method === "POST" && pathname === "/notebooks/cells") return { handler: createCell };
+  const m = pathname.match(/^\/notebooks\/cells\/(\d+)(\/run)?$/);
+  if (!m) return null;
+  const idx = parseInt(m[1], 10);
+  if (method === "PATCH" && !m[2]) return { cellIdx: idx, handler: editCell };
+  if (method === "POST" && m[2] === "/run") return { cellIdx: idx, handler: runCell };
+  return null;
+}
+
+async function listCells({ nb, res }: CellRouteCtx): Promise<void> {
+  const cells = nb.getCells().map((c, i) => ({
+    index: i,
+    kind: c.kind === vscode.NotebookCellKind.Code ? "code" : "markup",
+    languageId: c.document.languageId,
+    code: c.document.getText(),
+    executionSummary: c.executionSummary
+      ? {
+          success: c.executionSummary.success,
+          executionOrder: c.executionSummary.executionOrder,
+        }
+      : null,
+    outputs: c.outputs.map((o) => ({
+      items: o.items.map((it) => ({ mime: it.mime, text: textDecodeSafe(it.data) })),
+    })),
+  }));
+  writeJson(res, 200, { ok: true, result: { cells } });
+}
+
+async function createCell({ nb, body, res }: CellRouteCtx): Promise<void> {
+  if (typeof body?.code !== "string") {
+    writeJson(res, 400, { ok: false, error: "missing body.code (string)" });
+    return;
+  }
+  const kind =
+    body.kind === "markup" ? vscode.NotebookCellKind.Markup : vscode.NotebookCellKind.Code;
+  // Default code cell language to "mo-python" (marimo's custom Python id)
+  // for marimo notebooks. Without this, marimo's NotebookController doesn't
+  // own the cell and run-cell silently no-ops.
+  const isMarimo = nb.notebookType === "marimo-notebook";
+  const lang =
+    body.languageId ??
+    (kind === vscode.NotebookCellKind.Code ? (isMarimo ? "mo-python" : "python") : "markdown");
+  const idx = typeof body.index === "number" ? body.index : nb.cellCount;
+  const edit = new vscode.WorkspaceEdit();
+  edit.set(nb.uri, [
+    vscode.NotebookEdit.insertCells(idx, [
+      new vscode.NotebookCellData(kind, body.code, lang),
+    ]),
+  ]);
+  const ok = await vscode.workspace.applyEdit(edit);
+  writeJson(res, 200, { ok, result: { index: idx, cellCount: nb.cellCount } });
+}
+
+async function editCell({ nb, body, cellIdx, res }: CellRouteCtx): Promise<void> {
+  if (typeof body?.code !== "string") {
+    writeJson(res, 400, { ok: false, error: "missing body.code (string) — refusing to wipe cell" });
+    return;
+  }
+  const cell = nb.cellAt(cellIdx!);
+  const range = new vscode.Range(
+    cell.document.positionAt(0),
+    cell.document.positionAt(cell.document.getText().length),
+  );
+  const edit = new vscode.WorkspaceEdit();
+  edit.replace(cell.document.uri, range, body.code);
+  const ok = await vscode.workspace.applyEdit(edit);
+  writeJson(res, 200, { ok, result: { index: cellIdx } });
+}
+
+async function runCell({ nb, cellIdx, res }: CellRouteCtx): Promise<void> {
+  await vscode.commands.executeCommand("notebook.cell.execute", {
+    ranges: [{ start: cellIdx!, end: cellIdx! + 1 }],
+    document: nb.uri,
+  });
+  writeJson(res, 200, { ok: true, result: { queued: cellIdx } });
 }
 
 function textDecodeSafe(data: Uint8Array): string {
