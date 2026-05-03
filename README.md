@@ -175,6 +175,8 @@ marimo-upstream/
 
 ## Build & install
 
+> **Use [`SETUP.md`](./SETUP.md) for the current install procedure.** The block below is from initial development and includes obsolete steps (signature-verify disable, `__metadata` patching) that we later confirmed break the install. Kept for archaeology.
+
 ```bash
 # Build the bridge
 ( cd agent-bridge && \
