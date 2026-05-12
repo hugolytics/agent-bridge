@@ -4,6 +4,18 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
 
+// Subset of marimo-team.vscode-marimo's `experimental.kernels` API shape
+// (matches marimo-lsp/extension/src/platform/Api.ts on tag 0.13.0+).
+// Defined inline so the bridge has no dependency on the marimo package.
+interface MarimoOutputItem { mime: string; data: Uint8Array }
+interface MarimoOutput { items: MarimoOutputItem[] }
+interface MarimoKernel {
+  executeCode(
+    code: string,
+    token?: vscode.CancellationToken,
+  ): AsyncIterable<MarimoOutput>;
+}
+
 /**
  * Agent Bridge — a localhost HTTP server inside VS Code that lets external
  * agents (Claude Code CLI, MCP servers, scripts) drive marimo notebooks open
@@ -217,37 +229,99 @@ async function handle(
       return;
     }
 
-    const result = (await vscode.commands.executeCommand(
-      "marimo.executeAgentCode",
-      { notebookUri: sessionId, code: body.code },
-    )) as { stdout: string; stderr: string; error: string | null };
+    // Talk to marimo via the public experimental.kernels API exposed by
+    // marimo-team.vscode-marimo. This is what manzt pointed us at in
+    // marimo-team/marimo-lsp#545 — no fork required.
+    const ext = vscode.extensions.getExtension("marimo-team.vscode-marimo");
+    if (!ext) {
+      writeJson(res, 503, {
+        ok: false,
+        error: "marimo-team.vscode-marimo not installed",
+      });
+      return;
+    }
+    const marimoApi = (ext.isActive
+      ? ext.exports
+      : await ext.activate()) as
+      | {
+          experimental?: {
+            kernels?: {
+              getKernel(uri: vscode.Uri): Promise<MarimoKernel | undefined>;
+            };
+          };
+        }
+      | undefined;
+    const kernels = marimoApi?.experimental?.kernels;
+    if (!kernels) {
+      writeJson(res, 503, {
+        ok: false,
+        error: "marimo-team.vscode-marimo doesn't expose experimental.kernels (need >=0.13.0)",
+      });
+      return;
+    }
+    const kernel = await kernels.getKernel(vscode.Uri.parse(sessionId));
+    if (!kernel) {
+      writeJson(res, 404, {
+        ok: false,
+        error: `no active kernel for notebook (open it and bind the marimo kernel first): ${sessionId}`,
+      });
+      return;
+    }
 
-    // Emit as SSE so marimo-pair's execute-code.sh parser is happy.
+    // Stream kernel outputs straight into the marimo-pair SSE protocol.
+    // Cancel kernel work if the SSE client disconnects.
+    const cts = new vscode.CancellationTokenSource();
+    req.on("close", () => cts.cancel());
+
     res.statusCode = 200;
     res.setHeader("content-type", "text/event-stream");
     res.setHeader("cache-control", "no-cache");
-    if (result.stdout) {
-      res.write(`event: stdout\ndata: ${JSON.stringify({ data: result.stdout })}\n\n`);
+
+    const decoder = new TextDecoder();
+    const writeEvent = (event: string, data: unknown) => {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    };
+
+    let errored = false;
+    try {
+      for await (const output of kernel.executeCode(body.code, cts.token)) {
+        for (const item of output.items ?? []) {
+          const text = decoder.decode(item.data);
+          if (item.mime === "application/vnd.code.notebook.stdout") {
+            writeEvent("stdout", { data: text });
+          } else if (item.mime === "application/vnd.code.notebook.stderr") {
+            writeEvent("stderr", { data: text });
+          } else if (item.mime === "application/vnd.code.notebook.error") {
+            // JSON-encoded error per vscode.NotebookCellOutput.
+            let parsed: { name?: string; message?: string; stack?: string } = {};
+            try { parsed = JSON.parse(text); } catch { /* leave empty */ }
+            writeEvent("done", {
+              success: false,
+              error: { msg: parsed.message ?? parsed.name ?? text },
+            });
+            errored = true;
+            return;
+          } else {
+            // Rich output (text/plain, text/html, image/*, application/json).
+            // marimo-pair doesn't model these as a distinct channel; emit on
+            // stdout with the mime preserved so callers that want it can read.
+            writeEvent("stdout", { data: text, mime: item.mime });
+          }
+        }
+      }
+      writeEvent("done", { success: true, output: { data: "" } });
+    } catch (e) {
+      writeEvent("done", {
+        success: false,
+        error: { msg: String((e as Error)?.message ?? e) },
+      });
+      errored = true;
+    } finally {
+      // ESLint placeholder: errored is consulted by future test scaffolding.
+      void errored;
+      cts.dispose();
+      res.end();
     }
-    if (result.stderr) {
-      res.write(`event: stderr\ndata: ${JSON.stringify({ data: result.stderr })}\n\n`);
-    }
-    if (result.error) {
-      res.write(
-        `event: done\ndata: ${JSON.stringify({
-          success: false,
-          error: { msg: result.error },
-        })}\n\n`,
-      );
-    } else {
-      res.write(
-        `event: done\ndata: ${JSON.stringify({
-          success: true,
-          output: { data: "" },
-        })}\n\n`,
-      );
-    }
-    res.end();
     return;
   }
 
