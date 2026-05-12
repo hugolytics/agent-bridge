@@ -2,20 +2,20 @@
 
 Drive a marimo notebook open in VS Code from any external agent (Claude Code, Codex, plain `curl`) by talking to a localhost HTTP bridge that shares the editor's kernel state.
 
-This doc replaces the install sections of `USAGE.md` and `agent-bridge/README.md`, both of which were written during early-iteration debugging and contain instructions we later discovered were wrong (do **not** disable `extensions.verifySignature`; do **not** patch `__metadata.targetPlatform`).
+This doc replaces the install sections of `USAGE.md` and `agent-bridge/README.md`, both of which date from early-iteration debugging.
+
+> **History note (2026-05-05):** earlier versions of this stack required a fork of `marimo-team.vscode-marimo` plus a Python patch to `marimo-lsp/api.py`. Per maintainer feedback on [marimo-team/marimo-lsp#545](https://github.com/marimo-team/marimo-lsp/pull/545) we rewrote the bridge to use marimo-team's public `experimental.kernels` API (modeled on the vscode-jupyter integration pattern). **No fork is needed anymore** — only the marketplace extension + the bridge.
 
 ---
 
 ## What gets installed
 
-Two VS Code extensions, both into your active VS Code profile:
-
 | Extension | What it adds | Source |
 |---|---|---|
-| `hugolytics.vscode-marimo-agent` | Fork of `marimo-team.vscode-marimo`. Adds the `marimo.executeAgentCode` command **and** a 5-line Python patch so `marimo._code_mode.get_context()` resolves the open notebook's document. | `marimo-lsp/extension/` (this repo) |
-| `hugolytics.agent-bridge` | Tiny VS Code extension (~50 KB). Hosts a localhost HTTP server exposing `/api/sessions`, `/api/kernel/execute` (marimo-pair compatible SSE), `/notebooks/cells` (cell CRUD), `/commands/<id>` (escape hatch). | `agent-bridge/` (this repo) |
+| `marimo-team.vscode-marimo` (≥ 0.13.0) | The marimo notebook editor for VS Code. Exposes a public `experimental.kernels` API to sibling extensions. | VS Code marketplace |
+| `hugolytics.agent-bridge` | Tiny VS Code extension (~50 KB). Hosts a localhost HTTP server exposing `/api/sessions`, `/api/kernel/execute` (marimo-pair compatible SSE), `/notebooks/cells` (cell CRUD + run), `/commands/<id>` (escape hatch). Calls into `marimo-team.vscode-marimo` via `experimental.kernels.getKernel(uri).executeCode(...)`. | `agent-bridge/` (this repo) |
 
-No marimo-pair *fork* is needed — the unmodified [marimo-pair](https://github.com/marimo-team/marimo-pair) skill works as-is, just pointed at the bridge URL.
+The unmodified [marimo-pair](https://github.com/marimo-team/marimo-pair) skill from the superpowers marketplace works against this bridge — just point it at the bridge URL.
 
 ---
 
@@ -23,38 +23,33 @@ No marimo-pair *fork* is needed — the unmodified [marimo-pair](https://github.
 
 - macOS or Linux (Windows untested; the bridge code is platform-agnostic but install paths differ)
 - VS Code ≥ 1.96 (`code --version`)
-- `node` ≥ 22 (for the build step) — `brew install node` if you don't have it
-- A Python project with `marimo` installed in its venv (any version that ships `marimo._code_mode`, i.e. recent)
-- Optional: `gh` CLI logged in if you want to install pre-built VSIXes from GitHub releases (once published)
+- `node` ≥ 22 (only needed if building the bridge from source) — `brew install node` if you don't have it
+- A Python project with `marimo` installed in its venv
 
 ---
 
-## Install — three commands
+## Install — two extensions, one profile
 
 ```bash
-cd ~/VScode-projects   # or wherever you cloned this
-git clone https://github.com/hugolytics/marimo-lsp.git
-git clone https://github.com/hugolytics/agent-bridge.git
-
-# 1. Build both VSIXes from source (~30s combined)
-( cd marimo-lsp/extension      && pnpm install --frozen-lockfile && \
-    PATH="$(pnpm bin):$PATH" vsce package --no-dependencies )
-( cd agent-bridge              && pnpm install --frozen-lockfile && \
-    PATH="$(pnpm bin):$PATH" vsce package --no-dependencies )
-
-# 2. Find which VS Code profile you want to install into.
-#    If you've never created a custom profile, this is "Default".
-#    Otherwise look at User/profiles/ and pick the one your project is
-#    associated with (see "Profiles" troubleshooting section below).
-PROFILE="Default"   # or "hugo", "work", etc.
-
-# 3. Install both into that profile
 CODE='/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code'
-"$CODE" --profile "$PROFILE" --install-extension marimo-lsp/extension/vscode-marimo-agent-0.13.0.vsix
+
+# Pick the VS Code profile your project uses. If you've never created a
+# custom profile, this is "Default". Otherwise check
+# ~/Library/Application Support/Code/User/profiles/ and storage.json's
+# profileAssociations.workspaces map.
+PROFILE="Default"
+
+# 1. marimo-team's editor extension from the marketplace.
+"$CODE" --profile "$PROFILE" --install-extension marimo-team.vscode-marimo
+
+# 2. agent-bridge. Build from source (until we publish releases):
+git clone https://github.com/hugolytics/agent-bridge.git
+( cd agent-bridge && pnpm install --frozen-lockfile && \
+    PATH="$(pnpm bin):$PATH" vsce package --no-dependencies )
 "$CODE" --profile "$PROFILE" --install-extension agent-bridge/agent-bridge-0.1.0.vsix
 ```
 
-That's it. **Do not** patch `__metadata.targetPlatform`, **do not** disable `extensions.verifySignature` — we tried both, both made things worse. The default install path is correct as long as the `.vsixmanifest` doesn't claim a `TargetPlatform` (the build above runs `vsce package` without `--target`, which is what produces a working sideload).
+**Don't** patch `__metadata.targetPlatform`, **don't** disable `extensions.verifySignature` — those were dead-end fixes from when we were sideloading a fork; they actively break things now.
 
 ---
 
@@ -63,12 +58,12 @@ That's it. **Do not** patch `__metadata.targetPlatform`, **do not** disable `ext
 1. Open VS Code in a workspace that's associated with the profile you installed into.
 2. Open any `.py` file that's a marimo notebook.
 3. Click the marimo notebook icon in the editor toolbar — the notebook view appears.
-4. **Restart the kernel once** via `Cmd+Shift+P → marimo: Restart Notebook Kernel`. (The first kernel start binds the LSP session; without it, `cm.get_context()` and `/api/kernel/execute` will return "no session found".)
+4. Bind the kernel (`Cmd+Shift+P → marimo: Restart Notebook Kernel`, or pick the marimo controller from the kernel picker). The bridge can only reach kernels VS Code is actively managing.
 5. Verify the bridge is up:
 
    ```bash
    cat ~/.agent-bridge.json
-   # → {"port": 60146, "token": null, "pid": 36738, "started": ...}
+   # → {"port": 60146, "token": null, "pid": ..., "started": ...}
 
    PORT=$(node -e "console.log(require(process.env.HOME+'/.agent-bridge.json').port)")
    curl -sf "http://127.0.0.1:$PORT/health"
@@ -82,8 +77,6 @@ That's it. **Do not** patch `__metadata.targetPlatform`, **do not** disable `ext
 ### Claude Code with the marimo-pair skill (no skill changes)
 
 ```bash
-# The marimo-pair skill comes bundled with the superpowers marketplace.
-# If you don't have it: install via /plugin install superpowers
 PORT=$(node -e "console.log(require(process.env.HOME+'/.agent-bridge.json').port)")
 NB="file:///absolute/path/to/your/notebook.py"
 
@@ -93,11 +86,11 @@ bash ~/.claude/skills/marimo-pair/scripts/execute-code.sh \
   -c 'print("hello from agent")'
 ```
 
-The skill's `discover-servers.sh` can also find the bridge automatically because it writes a marimo-server registry file at `$XDG_STATE_HOME/marimo/servers/agent-bridge-<port>.json`.
+`discover-servers.sh` from the same skill also finds the bridge automatically — it writes itself into the marimo server registry at `$XDG_STATE_HOME/marimo/servers/agent-bridge-<port>.json`.
 
-### Codex / any agent that can run shell
+### Codex / any agent that can shell out
 
-Same pattern — read the port, hit `--url http://127.0.0.1:<port>`. The bridge speaks marimo-pair's protocol (SSE on `POST /api/kernel/execute`), so any agent that already targets marimo standalone works against the bridge by changing the URL.
+Same pattern: read the port from `~/.agent-bridge.json`, hit `--url http://127.0.0.1:<port>`. The bridge speaks marimo-pair's SSE protocol (`POST /api/kernel/execute` with `Marimo-Session-Id: <uri>` header).
 
 ### Direct REST (no skill)
 
@@ -105,13 +98,12 @@ Same pattern — read the port, hit `--url http://127.0.0.1:<port>`. The bridge 
 PORT=$(node -e "console.log(require(process.env.HOME+'/.agent-bridge.json').port)")
 NB="file:///absolute/path/to/your/notebook.py"
 
-# Run code in the kernel (marimo-pair protocol; SSE)
-curl -sf -X POST "http://127.0.0.1:$PORT/api/kernel/execute" \
-  -H "Marimo-Session-Id: $NB" \
-  -H 'content-type: application/json' \
+# Stream code in the kernel (marimo-pair SSE)
+curl -sN -X POST "http://127.0.0.1:$PORT/api/kernel/execute" \
+  -H "Marimo-Session-Id: $NB" -H 'content-type: application/json' \
   -d '{"code":"print(2 + 2)"}'
 
-# List cells (full code, outputs, execution summary)
+# List cells (code + outputs + executionSummary)
 curl -sf "http://127.0.0.1:$PORT/notebooks/cells?notebook=$NB" | jq .
 
 # Create a cell
@@ -130,14 +122,13 @@ curl -sf -X POST "http://127.0.0.1:$PORT/notebooks/cells/3/run?notebook=$NB"
 
 ---
 
-## Troubleshooting (the gotchas we actually hit)
+## Troubleshooting
 
-### "Install extension for marimo-notebook" prompt after install
+### "Install extension for marimo-notebook" prompt
 
-Your VS Code profile's extension registry doesn't know about the fork. Almost always: you have a custom profile (e.g. `hugo`) and installed into `Default`. Fix:
+Your VS Code profile's extension registry doesn't see `marimo-team.vscode-marimo`. Usually: you have a custom profile and installed into a different one. Find which profile your workspace uses:
 
 ```bash
-# Find which profile your workspace is associated with:
 python3 -c "
 import json, pathlib
 d = json.load(open(pathlib.Path.home() / 'Library/Application Support/Code/User/globalStorage/storage.json'))
@@ -146,35 +137,33 @@ for k, v in ws.items():
     if v != '__default__profile__':
         print(f'{v} <- {k}')
 "
-# Then reinstall both VSIXes with --profile <that-profile-name>.
-# The PROFILE NAME (not the dir hash) is in storage.json under userDataProfiles[].name.
+# Then reinstall both extensions with --profile <profile-name>.
 ```
 
-### `cm.get_context()` raises `NotebookDocument not available`
+### `503 marimo-team.vscode-marimo not installed`
 
-The LSP session for that notebook hasn't been bound yet. Restart the kernel: `Cmd+Shift+P → marimo: Restart Notebook Kernel`. (Happens after every `marimo: Restart Language Server` call, or after fresh install + window reload.)
+The bridge couldn't find the marimo extension in your current profile. Install it (`code --profile <name> --install-extension marimo-team.vscode-marimo`) and reload the window.
+
+### `404 no active kernel for notebook`
+
+The notebook is open as text but the marimo kernel hasn't been bound. Open it as a marimo notebook (click the marimo icon in the editor toolbar) and run any cell to provision the kernel.
 
 ### Bridge port not in `~/.agent-bridge.json`
 
-Bridge didn't activate. Check the VS Code output panel → "Agent Bridge" channel. Most common cause: another VS Code session already holds `~/.agent-bridge.json` — close it or look in `User/globalStorage/hugolytics.agent-bridge/agent-bridge.json` for this session's port.
-
-### "No session found" from `/api/kernel/execute`
-
-The marimo notebook isn't open in the editor for that URI. The bridge can only reach kernels that VS Code is actively managing. Open the notebook tab and rerun.
+Bridge didn't activate. Open the VS Code output panel → "Agent Bridge" channel. Most common cause: another VS Code session already holds `~/.agent-bridge.json` — close it or look in `User/globalStorage/hugolytics.agent-bridge/agent-bridge.json` for this session's port.
 
 ---
 
 ## Updating
 
 ```bash
-cd marimo-lsp     && git pull && ( cd extension && pnpm install && PATH="$(pnpm bin):$PATH" vsce package --no-dependencies )
-cd ../agent-bridge && git pull && pnpm install && PATH="$(pnpm bin):$PATH" vsce package --no-dependencies
+cd agent-bridge && git pull && pnpm install && \
+  PATH="$(pnpm bin):$PATH" vsce package --no-dependencies
 
 CODE='/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code'
-"$CODE" --profile "$PROFILE" --install-extension ./marimo-lsp/extension/vscode-marimo-agent-*.vsix
-"$CODE" --profile "$PROFILE" --install-extension ./agent-bridge/agent-bridge-*.vsix
+"$CODE" --profile "$PROFILE" --install-extension ./agent-bridge/agent-bridge-*.vsix --force
 
-# Reload window OR run marimo: Restart Language Server + Restart Notebook Kernel.
+# Reload the window. marimo-team.vscode-marimo updates itself from the marketplace.
 ```
 
 ---
@@ -183,10 +172,10 @@ CODE='/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code'
 
 ```
 marimo-upstream/
-├── SETUP.md             ← you are here (the only install doc that's current)
-├── USAGE.md             ← background and design notes; install section is obsolete (use this file)
-├── FORK-PR.md           ← draft of the upstream PR to marimo-team/marimo-lsp
-├── PUSH.sh              ← maintainer dispatch script (push fork branch, create bridge repo, open PR)
-├── marimo-lsp/          ← the fork (branch: feature/external-cell-control-commands)
-└── agent-bridge/        ← the bridge extension
+├── SETUP.md             ← you are here
+├── USAGE.md             ← architecture + REST reference (install section is obsolete)
+├── agent-bridge/        ← the bridge extension (https://github.com/hugolytics/agent-bridge)
+└── marimo-lsp/          ← archived fork (used by the closed PR #545; kept only for the
+                           Python `_code_mode` patch which is a candidate for a separate
+                           small upstream issue/PR)
 ```
