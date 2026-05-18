@@ -8,17 +8,25 @@
     "vscode": "^1.86.0"
   },
   "main": "./dist/extension.js",
+  "extensionDependencies": [
+    "marimo-team.vscode-marimo"
+  ],
   "activationEvents": [
-    "onStartupFinished"
+    "onNotebook:marimo-notebook"
   ],
   "contributes": {
     "configuration": {
       "title": "Agent Bridge",
       "properties": {
+        "agentBridge.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Start the localhost HTTP bridge when a marimo notebook is opened. Disable to keep the extension installed without spawning the server (useful if you want the marimo notebook editor only)."
+        },
         "agentBridge.port": {
           "type": "number",
           "default": 0,
-          "description": "Port for the bridge HTTP server. 0 = auto-pick (port written to ~/.agent-bridge.json)."
+          "description": "Port for the bridge HTTP server. 0 = auto-pick (port written to the discovery file under <globalStorage>/agent-bridge.json)."
         },
         "agentBridge.token": {
           "type": "string",

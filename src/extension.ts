@@ -51,11 +51,19 @@ interface MarimoKernel {
  */
 export function activate(ctx: vscode.ExtensionContext) {
   const cfg = vscode.workspace.getConfiguration("agentBridge");
+  const enabled = cfg.get<boolean>("enabled", true);
   const requestedPort = cfg.get<number>("port", 0);
   const token = cfg.get<string>("token", "") || "";
 
   const out = vscode.window.createOutputChannel("Agent Bridge");
   ctx.subscriptions.push(out);
+
+  if (!enabled) {
+    out.appendLine(
+      "agentBridge.enabled is false — skipping HTTP server. Flip the setting and reload to re-enable.",
+    );
+    return;
+  }
 
   const server = http.createServer((req, res) => {
     handle(req, res, token, out).catch((err) => {
@@ -282,7 +290,13 @@ async function handle(
       res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
     };
 
-    let errored = false;
+    // Capture the first .error item we see, but keep iterating so traceback
+    // stderr/stdout that arrives alongside still streams to the client.
+    // Emit the final done event from the catch/finally path so we always
+    // produce exactly one done event with the right success flag.
+    let firstError:
+      | { name?: string; message?: string; stack?: string; raw: string }
+      | undefined;
     try {
       for await (const output of kernel.executeCode(body.code, cts.token)) {
         for (const item of output.items ?? []) {
@@ -292,15 +306,15 @@ async function handle(
           } else if (item.mime === "application/vnd.code.notebook.stderr") {
             writeEvent("stderr", { data: text });
           } else if (item.mime === "application/vnd.code.notebook.error") {
-            // JSON-encoded error per vscode.NotebookCellOutput.
-            let parsed: { name?: string; message?: string; stack?: string } = {};
-            try { parsed = JSON.parse(text); } catch { /* leave empty */ }
-            writeEvent("done", {
-              success: false,
-              error: { msg: parsed.message ?? parsed.name ?? text },
-            });
-            errored = true;
-            return;
+            // JSON-encoded error per vscode.NotebookCellOutput.error().
+            // Don't terminate the stream — kernels may send traceback as
+            // follow-up stderr/stdout items in the same iteration.
+            if (!firstError) {
+              let parsed: { name?: string; message?: string; stack?: string } =
+                {};
+              try { parsed = JSON.parse(text); } catch { /* leave empty */ }
+              firstError = { ...parsed, raw: text };
+            }
           } else {
             // Rich output (text/plain, text/html, image/*, application/json).
             // marimo-pair doesn't model these as a distinct channel; emit on
@@ -309,16 +323,23 @@ async function handle(
           }
         }
       }
-      writeEvent("done", { success: true, output: { data: "" } });
+      if (firstError) {
+        writeEvent("done", {
+          success: false,
+          error: {
+            msg:
+              firstError.message ?? firstError.name ?? firstError.raw,
+          },
+        });
+      } else {
+        writeEvent("done", { success: true, output: { data: "" } });
+      }
     } catch (e) {
       writeEvent("done", {
         success: false,
         error: { msg: String((e as Error)?.message ?? e) },
       });
-      errored = true;
     } finally {
-      // ESLint placeholder: errored is consulted by future test scaffolding.
-      void errored;
       cts.dispose();
       res.end();
     }
