@@ -654,12 +654,13 @@ interface CellRoute {
 function matchCellRoute(method: string, pathname: string): CellRoute | null {
   if (method === "GET" && pathname === "/notebooks/cells") return { handler: listCells };
   if (method === "POST" && pathname === "/notebooks/cells") return { handler: createCell };
-  const m = pathname.match(/^\/notebooks\/cells\/(\d+)(\/run)?$/);
+  const m = pathname.match(/^\/notebooks\/cells\/(\d+)(\/run|\/outputs)?$/);
   if (!m) return null;
   const idx = parseInt(m[1], 10);
   if (method === "PATCH" && !m[2]) return { cellIdx: idx, handler: editCell };
   if (method === "DELETE" && !m[2]) return { cellIdx: idx, handler: deleteCell };
   if (method === "POST" && m[2] === "/run") return { cellIdx: idx, handler: runCell };
+  if (method === "GET" && m[2] === "/outputs") return { cellIdx: idx, handler: cellOutputs };
   return null;
 }
 
@@ -780,6 +781,38 @@ async function runCell({ nb, cellIdx, res }: CellRouteCtx): Promise<void> {
     document: nb.uri,
   });
   writeJson(res, 200, { ok: true, result: { queued: cellIdx } });
+}
+
+/**
+ * Mime types whose content is valid UTF-8 text and should be returned as a
+ * `data` string. Anything not in this set is binary and gets only `data_b64`.
+ * Stdout/stderr channel mimes are explicitly listed here because VS Code uses
+ * its own `application/vnd.code.notebook.*` namespace for them — not text/*.
+ */
+function isTextMime(mime: string): boolean {
+  return (
+    mime.startsWith("text/") ||
+    mime === "application/json" ||
+    mime.endsWith("+json") ||
+    mime === "application/vnd.code.notebook.stdout" ||
+    mime === "application/vnd.code.notebook.stderr" ||
+    mime === "application/vnd.code.notebook.error"
+  );
+}
+
+async function cellOutputs({ nb, cellIdx, res }: CellRouteCtx): Promise<void> {
+  const cell = nb.cellAt(cellIdx!);
+  const outputs = cell.outputs.map((o) => ({
+    items: o.items.map((it) => {
+      const b64 = Buffer.from(it.data).toString("base64");
+      if (isTextMime(it.mime)) {
+        // Include BOTH for stdout-as-bytes round-tripping.
+        return { mime: it.mime, data: textDecodeSafe(it.data), data_b64: b64 };
+      }
+      return { mime: it.mime, data_b64: b64 };
+    }),
+  }));
+  writeJson(res, 200, { ok: true, result: { cellIdx, outputs } });
 }
 
 function textDecodeSafe(data: Uint8Array): string {
