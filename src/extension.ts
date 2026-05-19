@@ -1,8 +1,17 @@
+import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
+
+type BridgeEvent =
+  | { kind: "cell-edited"; notebookUri: string; cellIdx: number; code: string; etag: string; ts: number }
+  | { kind: "cell-created"; notebookUri: string; cellIdx: number; code: string; ts: number }
+  | { kind: "cell-deleted"; notebookUri: string; cellIdx: number; ts: number };
+
+const bridgeEvents = new EventEmitter();
+bridgeEvents.setMaxListeners(0); // many SSE clients allowed
 
 // Subset of marimo-team.vscode-marimo's `experimental.kernels` API shape
 // (matches marimo-lsp/extension/src/platform/Api.ts on tag 0.13.0+).
@@ -65,6 +74,51 @@ export function activate(ctx: vscode.ExtensionContext) {
     );
     return;
   }
+
+  // Watch for notebook document changes and emit structured events onto the
+  // module-level bridgeEvents bus. SSE clients connected to GET /events pick
+  // these up in real time. Runs regardless of HTTP server start mode so the
+  // event bus is always hot once the extension is enabled.
+  const changeSub = vscode.workspace.onDidChangeNotebookDocument((e) => {
+    const nbUri = e.notebook.uri.toString();
+    const ts = Date.now();
+    for (const change of e.contentChanges) {
+      // VS Code 1.86+ NotebookDocumentContentChange shape:
+      // { range, addedCells: NotebookCell[], removedCells: NotebookCell[] }
+      const removedLen = change.removedCells?.length ?? 0;
+      for (let i = 0; i < removedLen; i++) {
+        bridgeEvents.emit("event", {
+          kind: "cell-deleted",
+          notebookUri: nbUri,
+          cellIdx: change.range.start + i,
+          ts,
+        } satisfies BridgeEvent);
+      }
+      for (const addedCell of change.addedCells ?? []) {
+        bridgeEvents.emit("event", {
+          kind: "cell-created",
+          notebookUri: nbUri,
+          cellIdx: addedCell.index,
+          code: addedCell.document.getText(),
+          ts,
+        } satisfies BridgeEvent);
+      }
+    }
+    for (const cellChange of e.cellChanges ?? []) {
+      if (cellChange.document) {
+        const code = cellChange.cell.document.getText();
+        bridgeEvents.emit("event", {
+          kind: "cell-edited",
+          notebookUri: nbUri,
+          cellIdx: cellChange.cell.index,
+          code,
+          etag: cellEtag(code),
+          ts,
+        } satisfies BridgeEvent);
+      }
+    }
+  });
+  ctx.subscriptions.push(changeSub);
 
   // The bridge activates eagerly (onStartupFinished) but defers starting the
   // HTTP server until a marimo notebook is actually open — that way production
@@ -492,6 +546,33 @@ async function handle(
     await vscode.window.showNotebookDocument(nb);
     await vscode.commands.executeCommand("notebook.cancelExecution");
     writeJson(res, 200, { ok: true, result: { interrupted: true, notebookUri: nbUri } });
+    return;
+  }
+
+  // ---- SSE event stream ---------------------------------------------------
+  // GET /events?notebook=<encoded-uri> — streams BridgeEvent objects as SSE.
+  // Without ?notebook=, all notebooks' events stream (wildcard mode).
+  // A 15-second heartbeat comment keeps intermediaries from dropping the conn.
+  if (req.method === "GET" && url.pathname === "/events") {
+    const nbFilter = url.searchParams.get("notebook");
+    res.statusCode = 200;
+    res.setHeader("content-type", "text/event-stream");
+    res.setHeader("cache-control", "no-cache");
+    res.setHeader("connection", "keep-alive");
+    // Heartbeat so intermediaries don't drop the connection on idle.
+    const hb = setInterval(() => res.write(":hb\n\n"), 15_000);
+    const onEvent = (e: BridgeEvent) => {
+      if (nbFilter && e.notebookUri !== nbFilter) return;
+      res.write(`event: ${e.kind}\ndata: ${JSON.stringify(e)}\n\n`);
+    };
+    bridgeEvents.on("event", onEvent);
+    req.on("close", () => {
+      clearInterval(hb);
+      bridgeEvents.off("event", onEvent);
+      res.end();
+    });
+    // Send an immediate hello so a synchronous test can confirm connection.
+    res.write(`event: hello\ndata: {"ts":${Date.now()}}\n\n`);
     return;
   }
 
