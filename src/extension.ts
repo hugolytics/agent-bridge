@@ -559,20 +559,31 @@ async function handle(
     res.setHeader("content-type", "text/event-stream");
     res.setHeader("cache-control", "no-cache");
     res.setHeader("connection", "keep-alive");
-    // Heartbeat so intermediaries don't drop the connection on idle.
-    const hb = setInterval(() => res.write(":hb\n\n"), 15_000);
-    const onEvent = (e: BridgeEvent) => {
-      if (nbFilter && e.notebookUri !== nbFilter) return;
-      res.write(`event: ${e.kind}\ndata: ${JSON.stringify(e)}\n\n`);
-    };
-    bridgeEvents.on("event", onEvent);
-    req.on("close", () => {
+    // Any res.write can throw if the client disconnected between listener
+    // registration and the write — tear down listeners on the first failure
+    // so we don't accumulate dead callbacks.
+    let closed = false;
+    const teardown = () => {
+      if (closed) return;
+      closed = true;
       clearInterval(hb);
       bridgeEvents.off("event", onEvent);
-      res.end();
-    });
+      try { res.end(); } catch { /* socket already gone */ }
+    };
+    const safeWrite = (chunk: string) => {
+      if (closed) return;
+      try { res.write(chunk); } catch { teardown(); }
+    };
+    // Heartbeat so intermediaries don't drop the connection on idle.
+    const hb = setInterval(() => safeWrite(":hb\n\n"), 15_000);
+    const onEvent = (e: BridgeEvent) => {
+      if (nbFilter && e.notebookUri !== nbFilter) return;
+      safeWrite(`event: ${e.kind}\ndata: ${JSON.stringify(e)}\n\n`);
+    };
+    bridgeEvents.on("event", onEvent);
+    req.on("close", teardown);
     // Send an immediate hello so a synchronous test can confirm connection.
-    res.write(`event: hello\ndata: {"ts":${Date.now()}}\n\n`);
+    safeWrite(`event: hello\ndata: {"ts":${Date.now()}}\n\n`);
     return;
   }
 
@@ -828,6 +839,10 @@ function textDecodeSafe(data: Uint8Array): string {
  * agent that GETs then PATCHes can detect a user edit in between. NOT
  * cryptographic; collisions are fine because we only use this for "did the
  * cell change since you read it?" comparisons within a session.
+ *
+ * Hashes UTF-16 code units (not UTF-8 bytes), so two cells that differ only
+ * in unpaired surrogates could theoretically collide. Tolerated — agents
+ * resync via the change-event stream, not the etag space.
  */
 function cellEtag(code: string): string {
   // FNV-1a 32-bit; 8 hex chars is plenty for in-session diffing.
