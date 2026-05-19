@@ -12,7 +12,7 @@
     "marimo-team.vscode-marimo"
   ],
   "activationEvents": [
-    "onNotebook:marimo-notebook"
+    "onStartupFinished"
   ],
   "contributes": {
     "configuration": {
@@ -22,6 +22,11 @@
           "type": "boolean",
           "default": true,
           "description": "Start the localhost HTTP bridge when a marimo notebook is opened. Disable to keep the extension installed without spawning the server (useful if you want the marimo notebook editor only)."
+        },
+        "agentBridge.eagerStart": {
+          "type": "boolean",
+          "default": false,
+          "description": "Start the HTTP server as soon as VS Code activates the bridge, instead of waiting for a marimo notebook to open. Useful for test harnesses that need to call marimo.openAsMarimoNotebook through the bridge before any notebook is open."
         },
         "agentBridge.port": {
           "type": "number",

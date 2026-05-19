@@ -52,6 +52,7 @@ interface MarimoKernel {
 export function activate(ctx: vscode.ExtensionContext) {
   const cfg = vscode.workspace.getConfiguration("agentBridge");
   const enabled = cfg.get<boolean>("enabled", true);
+  const eagerStart = cfg.get<boolean>("eagerStart", false);
   const requestedPort = cfg.get<number>("port", 0);
   const token = cfg.get<string>("token", "") || "";
 
@@ -65,6 +66,46 @@ export function activate(ctx: vscode.ExtensionContext) {
     return;
   }
 
+  // The bridge activates eagerly (onStartupFinished) but defers starting the
+  // HTTP server until a marimo notebook is actually open — that way production
+  // users get lazy-server behavior without the chicken-and-egg the sandbox
+  // and other test harnesses hit (where the bridge needs to be up *before*
+  // marimo.openAsMarimoNotebook is called). Set agentBridge.eagerStart=true
+  // (or open a marimo notebook before VS Code starts) to start immediately.
+  let started = false;
+  const startServer = () => {
+    if (started) return;
+    started = true;
+    listenAndAnnounce(ctx, requestedPort, token, out);
+  };
+
+  const hasMarimoOpen = vscode.workspace.notebookDocuments.some(
+    (n) => n.notebookType === "marimo-notebook",
+  );
+  if (eagerStart || hasMarimoOpen) {
+    out.appendLine(
+      eagerStart
+        ? "eagerStart=true — starting HTTP server now"
+        : "marimo notebook already open — starting HTTP server now",
+    );
+    startServer();
+  } else {
+    out.appendLine(
+      "deferred — HTTP server will start when a marimo notebook opens (set agentBridge.eagerStart=true to skip the wait)",
+    );
+    const sub = vscode.workspace.onDidOpenNotebookDocument((nb) => {
+      if (nb.notebookType === "marimo-notebook") startServer();
+    });
+    ctx.subscriptions.push(sub);
+  }
+}
+
+function listenAndAnnounce(
+  ctx: vscode.ExtensionContext,
+  requestedPort: number,
+  token: string,
+  out: vscode.OutputChannel,
+): void {
   const server = http.createServer((req, res) => {
     handle(req, res, token, out).catch((err) => {
       out.appendLine(`unhandled: ${err?.stack ?? String(err)}`);
@@ -346,8 +387,116 @@ async function handle(
     return;
   }
 
+  // ---- Editor & notebook lifecycle (URI resolution, open, state) --------
+  // These activate before the cell-CRUD routes so they take priority over the
+  // generic /notebooks/* path. None of them touch the kernel.
+
+  if (req.method === "GET" && url.pathname === "/notebooks") {
+    const fsPath = url.searchParams.get("path");
+    if (!fsPath) {
+      writeJson(res, 400, { ok: false, error: "missing ?path=<fs-path>" });
+      return;
+    }
+    const nb = vscode.workspace.notebookDocuments.find(
+      (n) => n.uri.fsPath === fsPath,
+    );
+    if (!nb) {
+      writeJson(res, 404, {
+        ok: false,
+        error: `no open notebook with fsPath ${fsPath}`,
+        openNotebooks: vscode.workspace.notebookDocuments.map((n) => n.uri.toString()),
+      });
+      return;
+    }
+    writeJson(res, 200, { ok: true, result: { uri: nb.uri.toString(), fsPath: nb.uri.fsPath } });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/notebooks/open") {
+    const body = await readJson(req).catch(() => ({}));
+    if (typeof body?.uri !== "string") {
+      writeJson(res, 400, { ok: false, error: "missing body.uri (string)" });
+      return;
+    }
+    const existing = vscode.workspace.notebookDocuments.find(
+      (n) => n.uri.toString() === body.uri,
+    );
+    if (existing) {
+      writeJson(res, 200, { ok: true, result: { uri: existing.uri.toString(), alreadyOpen: true } });
+      return;
+    }
+    await vscode.commands.executeCommand(
+      "vscode.openWith",
+      vscode.Uri.parse(body.uri),
+      "marimo-notebook",
+    );
+    writeJson(res, 200, { ok: true, result: { uri: body.uri, alreadyOpen: false } });
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/editor/state") {
+    const nbUriParam = url.searchParams.get("notebook");
+    const editor = vscode.window.activeNotebookEditor;
+    const nb = nbUriParam
+      ? vscode.workspace.notebookDocuments.find((n) => n.uri.toString() === nbUriParam)
+      : editor?.notebook;
+    if (!nb) {
+      writeJson(res, 404, { ok: false, error: "no active or matching notebook" });
+      return;
+    }
+    const matchingEditor =
+      editor && editor.notebook.uri.toString() === nb.uri.toString() ? editor : undefined;
+    // Selections are NotebookRange[]; collect every selected cell index.
+    const selected: number[] = [];
+    if (matchingEditor) {
+      for (const range of matchingEditor.selections) {
+        for (let i = range.start; i < range.end; i++) selected.push(i);
+      }
+    }
+    const activeCell =
+      matchingEditor && matchingEditor.selection
+        ? matchingEditor.selection.start
+        : null;
+    // Cell tags don't exist in marimo's notebook model today. Expose an empty
+    // object so consumers can write code against a stable shape; will fill in
+    // when marimo or VS Code adds a tag mechanism.
+    writeJson(res, 200, {
+      ok: true,
+      result: {
+        notebookUri: nb.uri.toString(),
+        selected,
+        activeCell,
+        cellTags: {},
+      },
+    });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/kernel/interrupt") {
+    const body = await readJson(req).catch(() => ({}));
+    const nbUri = body?.notebookUri ?? url.searchParams.get("notebook");
+    if (!nbUri) {
+      writeJson(res, 400, { ok: false, error: "missing body.notebookUri or ?notebook=<uri>" });
+      return;
+    }
+    const nb = vscode.workspace.notebookDocuments.find(
+      (n) => n.uri.toString() === nbUri,
+    );
+    if (!nb) {
+      writeJson(res, 404, { ok: false, error: `notebook not open: ${nbUri}` });
+      return;
+    }
+    // Cancel any in-flight cell execution for this notebook. VS Code's
+    // notebook.cancelExecution operates on the active editor; we ensure the
+    // target notebook is active first via vscode.window.showNotebookDocument.
+    await vscode.window.showNotebookDocument(nb);
+    await vscode.commands.executeCommand("notebook.cancelExecution");
+    writeJson(res, 200, { ok: true, result: { interrupted: true, notebookUri: nbUri } });
+    return;
+  }
+
   // ---- Notebook cell mutation -------------------------------------------
-  // All four endpoints share the same pattern: locate the notebook (by ?notebook=
+  // All endpoints share the same pattern: locate the notebook (by ?notebook=
   // or body.notebookUri), validate the cell index if the URL has one, then run
   // a small handler. Single dispatch table keeps validation in one place
   // (audit found PATCH-with-no-code wiped cells + run-out-of-bounds was
@@ -423,26 +572,42 @@ function matchCellRoute(method: string, pathname: string): CellRoute | null {
   if (!m) return null;
   const idx = parseInt(m[1], 10);
   if (method === "PATCH" && !m[2]) return { cellIdx: idx, handler: editCell };
+  if (method === "DELETE" && !m[2]) return { cellIdx: idx, handler: deleteCell };
   if (method === "POST" && m[2] === "/run") return { cellIdx: idx, handler: runCell };
   return null;
 }
 
 async function listCells({ nb, res }: CellRouteCtx): Promise<void> {
-  const cells = nb.getCells().map((c, i) => ({
-    index: i,
-    kind: c.kind === vscode.NotebookCellKind.Code ? "code" : "markup",
-    languageId: c.document.languageId,
-    code: c.document.getText(),
-    executionSummary: c.executionSummary
+  const cells = nb.getCells().map((c, i) => {
+    const summary = c.executionSummary;
+    // VS Code's executionSummary.timing is {startTime, endTime} in ms since
+    // epoch when the cell has run. duration_ms is the obvious derivative — we
+    // compute it here so agents reasoning about "how much work is in flight"
+    // or "what's stale" don't have to.
+    const timing = summary?.timing
       ? {
-          success: c.executionSummary.success,
-          executionOrder: c.executionSummary.executionOrder,
+          startTime: summary.timing.startTime,
+          endTime: summary.timing.endTime,
+          duration_ms: summary.timing.endTime - summary.timing.startTime,
         }
-      : null,
-    outputs: c.outputs.map((o) => ({
-      items: o.items.map((it) => ({ mime: it.mime, text: textDecodeSafe(it.data) })),
-    })),
-  }));
+      : null;
+    return {
+      index: i,
+      kind: c.kind === vscode.NotebookCellKind.Code ? "code" : "markup",
+      languageId: c.document.languageId,
+      code: c.document.getText(),
+      executionSummary: summary
+        ? {
+            success: summary.success,
+            executionOrder: summary.executionOrder,
+          }
+        : null,
+      timing,
+      outputs: c.outputs.map((o) => ({
+        items: o.items.map((it) => ({ mime: it.mime, text: textDecodeSafe(it.data) })),
+      })),
+    };
+  });
   writeJson(res, 200, { ok: true, result: { cells } });
 }
 
@@ -485,6 +650,17 @@ async function editCell({ nb, body, cellIdx, res }: CellRouteCtx): Promise<void>
   edit.replace(cell.document.uri, range, body.code);
   const ok = await vscode.workspace.applyEdit(edit);
   writeJson(res, 200, { ok, result: { index: cellIdx } });
+}
+
+async function deleteCell({ nb, cellIdx, res }: CellRouteCtx): Promise<void> {
+  const edit = new vscode.WorkspaceEdit();
+  edit.set(nb.uri, [
+    vscode.NotebookEdit.deleteCells(
+      new vscode.NotebookRange(cellIdx!, cellIdx! + 1),
+    ),
+  ]);
+  const ok = await vscode.workspace.applyEdit(edit);
+  writeJson(res, 200, { ok, result: { deletedIndex: cellIdx, cellCount: nb.cellCount } });
 }
 
 async function runCell({ nb, cellIdx, res }: CellRouteCtx): Promise<void> {
