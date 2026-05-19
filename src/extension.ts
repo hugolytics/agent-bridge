@@ -530,7 +530,11 @@ async function handle(
       });
       return;
     }
-    await cellRoute.handler({ nb, body, cellIdx: cellRoute.cellIdx, res });
+    const ifMatch =
+      (req.headers["if-match"] as string | undefined) ??
+      body?.expectedEtag ??
+      undefined;
+    await cellRoute.handler({ nb, body, cellIdx: cellRoute.cellIdx, res, ifMatch });
     return;
   }
 
@@ -558,6 +562,7 @@ interface CellRouteCtx {
   body: any;
   cellIdx: number | undefined;
   res: http.ServerResponse;
+  ifMatch?: string;
 }
 
 interface CellRoute {
@@ -580,6 +585,7 @@ function matchCellRoute(method: string, pathname: string): CellRoute | null {
 async function listCells({ nb, res }: CellRouteCtx): Promise<void> {
   const cells = nb.getCells().map((c, i) => {
     const summary = c.executionSummary;
+    const code = c.document.getText();
     // VS Code's executionSummary.timing is {startTime, endTime} in ms since
     // epoch when the cell has run. duration_ms is the obvious derivative — we
     // compute it here so agents reasoning about "how much work is in flight"
@@ -595,7 +601,8 @@ async function listCells({ nb, res }: CellRouteCtx): Promise<void> {
       index: i,
       kind: c.kind === vscode.NotebookCellKind.Code ? "code" : "markup",
       languageId: c.document.languageId,
-      code: c.document.getText(),
+      code,
+      etag: cellEtag(code),
       executionSummary: summary
         ? {
             success: summary.success,
@@ -636,12 +643,22 @@ async function createCell({ nb, body, res }: CellRouteCtx): Promise<void> {
   writeJson(res, 200, { ok, result: { index: idx, cellCount: nb.cellCount } });
 }
 
-async function editCell({ nb, body, cellIdx, res }: CellRouteCtx): Promise<void> {
+async function editCell({ nb, body, cellIdx, res, ifMatch }: CellRouteCtx): Promise<void> {
   if (typeof body?.code !== "string") {
     writeJson(res, 400, { ok: false, error: "missing body.code (string) — refusing to wipe cell" });
     return;
   }
   const cell = nb.cellAt(cellIdx!);
+  const currentEtag = cellEtag(cell.document.getText());
+  if (ifMatch !== undefined && ifMatch !== currentEtag) {
+    writeJson(res, 409, {
+      ok: false,
+      error: "etag mismatch — cell changed since you read it",
+      currentEtag,
+      providedEtag: ifMatch,
+    });
+    return;
+  }
   const range = new vscode.Range(
     cell.document.positionAt(0),
     cell.document.positionAt(cell.document.getText().length),
@@ -649,10 +666,23 @@ async function editCell({ nb, body, cellIdx, res }: CellRouteCtx): Promise<void>
   const edit = new vscode.WorkspaceEdit();
   edit.replace(cell.document.uri, range, body.code);
   const ok = await vscode.workspace.applyEdit(edit);
-  writeJson(res, 200, { ok, result: { index: cellIdx } });
+  writeJson(res, 200, { ok, result: { index: cellIdx, etag: cellEtag(body.code) } });
 }
 
-async function deleteCell({ nb, cellIdx, res }: CellRouteCtx): Promise<void> {
+async function deleteCell({ nb, cellIdx, res, ifMatch }: CellRouteCtx): Promise<void> {
+  if (ifMatch !== undefined) {
+    const cell = nb.cellAt(cellIdx!);
+    const currentEtag = cellEtag(cell.document.getText());
+    if (ifMatch !== currentEtag) {
+      writeJson(res, 409, {
+        ok: false,
+        error: "etag mismatch — cell changed since you read it",
+        currentEtag,
+        providedEtag: ifMatch,
+      });
+      return;
+    }
+  }
   const edit = new vscode.WorkspaceEdit();
   edit.set(nb.uri, [
     vscode.NotebookEdit.deleteCells(
@@ -677,6 +707,22 @@ function textDecodeSafe(data: Uint8Array): string {
   } catch {
     return "";
   }
+}
+
+/**
+ * Short stable hash of a cell's code — optimistic-concurrency token so an
+ * agent that GETs then PATCHes can detect a user edit in between. NOT
+ * cryptographic; collisions are fine because we only use this for "did the
+ * cell change since you read it?" comparisons within a session.
+ */
+function cellEtag(code: string): string {
+  // FNV-1a 32-bit; 8 hex chars is plenty for in-session diffing.
+  let h = 0x811c9dc5;
+  for (let i = 0; i < code.length; i++) {
+    h ^= code.charCodeAt(i);
+    h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
 }
 
 async function readJson(req: http.IncomingMessage): Promise<any> {
