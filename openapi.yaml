@@ -1,0 +1,661 @@
+openapi: 3.1.0
+info:
+  title: agent-bridge
+  version: 0.2.0
+  description: |
+    Localhost HTTP bridge inside `marimo-team.vscode-marimo` so external agents
+    (Claude Code, Codex, MCP servers, scripts) can drive marimo notebooks open
+    in VS Code with the same kernel state the user sees.
+
+    The bridge exposes three surfaces:
+
+    1. **marimo-pair-compatible SSE** (`/api/sessions`, `/api/kernel/execute`)
+       so unmodified marimo-pair clients work against this bridge — they
+       discover it via `$XDG_STATE_HOME/marimo/servers/agent-bridge-<port>.json`
+       and connect as if it were a `marimo edit` server.
+    2. **REST cell CRUD + kernel lifecycle** (`/notebooks/*`, `/editor/state`,
+       `/api/kernel/interrupt`) for richer agent workflows than scratchpad
+       execution alone.
+    3. **SSE event stream** (`/events`) for reactivity — agents subscribe and
+       receive cell-edited / cell-created / cell-deleted events backed by
+       `vscode.workspace.onDidChangeNotebookDocument`.
+
+    Concurrency: every cell exposes a stable per-cell `etag` (FNV-1a 32-bit
+    hash of cell code). `PATCH`/`DELETE` accept an `If-Match: <etag>` header
+    (or `expectedEtag` in the body) and 409 with `currentEtag` on stale
+    reads — read-before-write protection mirroring `marimo#9585`.
+
+    Effect hints follow the Apps SDK convention: each operation declares
+    `x-agentBridge-effect` as one of `read | mutate | destructive | run | watch`
+    so a permission-mode UX can choose `auto` vs `always-ask` from a single
+    machine-readable catalogue rather than per-route hand-rolls.
+  contact:
+    name: hugolytics/agent-bridge
+    url: https://github.com/hugolytics/agent-bridge
+
+servers:
+  - url: http://127.0.0.1:{port}
+    description: localhost; port written to discovery file on listen
+    variables:
+      port:
+        default: "0"
+        description: |
+          0 means auto-pick. Actual port is in
+          `<globalStorage>/agent-bridge.json` or `$XDG_STATE_HOME/marimo/servers/agent-bridge-<port>.json`.
+
+security:
+  - bearerAuth: []
+  - {}   # auth optional; localhost-only by default
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Optional. Off by default (localhost-only). Configure via
+        `agentBridge.token` to require `Authorization: Bearer <token>`
+        on every request. Useful for shared dev machines.
+
+  schemas:
+    Ok:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        result:
+          description: Endpoint-specific payload.
+
+    Err:
+      type: object
+      required: [ok, error]
+      properties:
+        ok:
+          type: boolean
+          enum: [false]
+        error:
+          type: string
+
+    EtagConflict:
+      allOf:
+        - $ref: "#/components/schemas/Err"
+        - type: object
+          required: [currentEtag, providedEtag]
+          properties:
+            currentEtag:
+              $ref: "#/components/schemas/Etag"
+            providedEtag:
+              type: string
+
+    Etag:
+      type: string
+      pattern: "^[0-9a-f]{8}$"
+      description: |
+        FNV-1a 32-bit hash of cell code, 8 hex chars. Not cryptographic;
+        only used for "did the cell change since you read it?" within a
+        session. UTF-16 code-unit iteration — two cells differing only in
+        unpaired surrogates could collide. Tolerated because agents resync
+        via the change-event stream, not the etag space.
+
+    Cell:
+      type: object
+      required: [index, kind, languageId, code, etag, outputs]
+      properties:
+        index: { type: integer, minimum: 0 }
+        kind: { type: string, enum: [code, markup] }
+        languageId: { type: string, examples: [mo-python, python, markdown] }
+        code: { type: string }
+        etag: { $ref: "#/components/schemas/Etag" }
+        executionSummary:
+          oneOf:
+            - type: "null"
+            - type: object
+              properties:
+                success: { type: boolean }
+                executionOrder: { type: integer, nullable: true }
+        timing:
+          oneOf:
+            - type: "null"
+            - type: object
+              required: [startTime, endTime, duration_ms]
+              properties:
+                startTime: { type: integer, description: ms since epoch }
+                endTime: { type: integer, description: ms since epoch }
+                duration_ms: { type: integer }
+        outputs:
+          type: array
+          items:
+            type: object
+            properties:
+              items:
+                type: array
+                items:
+                  type: object
+                  required: [mime, text]
+                  properties:
+                    mime: { type: string }
+                    text:
+                      type: string
+                      description: |
+                        Lossy `TextDecoder` decode of the output bytes — fine
+                        for stdout/stderr/HTML, mojibakes binary mimes. Use
+                        `GET /notebooks/cells/N/outputs` for byte-exact.
+
+    OutputItem:
+      type: object
+      required: [mime]
+      properties:
+        mime: { type: string }
+        data:
+          type: string
+          description: utf-8 decoded text — present iff mime is text-like
+        data_b64:
+          type: string
+          description: base64-encoded raw bytes — present for binary mimes AND for stdout/stderr (so callers can do a byte-exact round-trip even when upstream stdout is bytes)
+
+    BridgeEvent:
+      oneOf:
+        - $ref: "#/components/schemas/CellEditedEvent"
+        - $ref: "#/components/schemas/CellCreatedEvent"
+        - $ref: "#/components/schemas/CellDeletedEvent"
+
+    CellEditedEvent:
+      type: object
+      required: [kind, notebookUri, cellIdx, code, etag, ts]
+      properties:
+        kind: { type: string, enum: [cell-edited] }
+        notebookUri: { type: string, format: uri }
+        cellIdx: { type: integer, minimum: 0 }
+        code: { type: string }
+        etag: { $ref: "#/components/schemas/Etag" }
+        ts: { type: integer, description: ms since epoch }
+
+    CellCreatedEvent:
+      type: object
+      required: [kind, notebookUri, cellIdx, code, ts]
+      properties:
+        kind: { type: string, enum: [cell-created] }
+        notebookUri: { type: string, format: uri }
+        cellIdx: { type: integer, minimum: 0 }
+        code: { type: string }
+        ts: { type: integer }
+
+    CellDeletedEvent:
+      type: object
+      required: [kind, notebookUri, cellIdx, ts]
+      properties:
+        kind: { type: string, enum: [cell-deleted] }
+        notebookUri: { type: string, format: uri }
+        cellIdx: { type: integer, minimum: 0 }
+        ts: { type: integer }
+
+  parameters:
+    NotebookUriQuery:
+      name: notebook
+      in: query
+      required: true
+      schema: { type: string, format: uri }
+      description: URI of the open marimo notebook, e.g. `file:///path/to/notebook.py`
+    CellIdxPath:
+      name: cellIdx
+      in: path
+      required: true
+      schema: { type: integer, minimum: 0 }
+    IfMatchHeader:
+      name: If-Match
+      in: header
+      required: false
+      schema: { $ref: "#/components/schemas/Etag" }
+      description: |
+        If present, the bridge compares against the current `etag` of the
+        target cell and returns 409 on mismatch. Omit for back-compat
+        (operation succeeds unconditionally).
+
+  responses:
+    EtagMismatch:
+      description: |
+        The `If-Match` (or `expectedEtag`) didn't match the cell's current
+        etag. Response body carries `currentEtag` so the caller can resync
+        without re-listing all cells.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/EtagConflict" }
+    NotebookNotOpen:
+      description: No open marimo notebook matched the requested URI / fsPath.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Err" }
+
+paths:
+  /health:
+    get:
+      summary: Liveness probe
+      tags: [meta]
+      x-agentBridge-effect: read
+      responses:
+        "200":
+          description: Bridge is up
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, port, vscodeVersion]
+                properties:
+                  ok: { type: boolean, enum: [true] }
+                  port: { type: integer }
+                  vscodeVersion: { type: string }
+
+  /api/sessions:
+    get:
+      summary: List active marimo notebook sessions (marimo-pair compat)
+      tags: [marimo-pair]
+      x-agentBridge-effect: read
+      responses:
+        "200":
+          description: Map of notebookUri → session metadata
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: object
+                  properties:
+                    filename: { type: string }
+
+  /api/kernel/execute:
+    post:
+      summary: Execute scratchpad code (marimo-pair SSE protocol)
+      tags: [marimo-pair]
+      x-agentBridge-effect: run
+      parameters:
+        - name: Marimo-Session-Id
+          in: header
+          required: true
+          schema: { type: string, format: uri }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: { type: string }
+      responses:
+        "200":
+          description: |
+            SSE stream of events: `stdout`, `stderr`, `done`. The `done` event
+            carries `{success, error?, output?}`. Cancellation: closing the
+            HTTP connection cancels kernel work via `CancellationTokenSource`.
+          content:
+            text/event-stream: {}
+
+  /api/kernel/interrupt:
+    post:
+      summary: Cancel in-flight cell execution on the given notebook
+      tags: [kernel]
+      x-agentBridge-effect: destructive
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [notebookUri]
+              properties:
+                notebookUri: { type: string, format: uri }
+      responses:
+        "200":
+          description: Interrupt dispatched
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Ok" }
+        "404":
+          description: Notebook not open
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Err" }
+
+  /editor/state:
+    get:
+      summary: Selected cells, active cell, cell tags (placeholder)
+      tags: [editor]
+      x-agentBridge-effect: read
+      parameters:
+        - name: notebook
+          in: query
+          required: false
+          schema: { type: string, format: uri }
+          description: |
+            If omitted, returns state of the active notebook editor. If given,
+            returns state for that notebook only when it's the active editor.
+      responses:
+        "200":
+          description: Editor state
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Ok"
+                  - type: object
+                    properties:
+                      result:
+                        type: object
+                        required: [notebookUri, selected, activeCell, cellTags]
+                        properties:
+                          notebookUri: { type: string, format: uri }
+                          selected:
+                            type: array
+                            items: { type: integer, minimum: 0 }
+                          activeCell:
+                            oneOf:
+                              - type: integer
+                              - type: "null"
+                          cellTags:
+                            type: object
+                            description: |
+                              Empty `{}` today — marimo has no native tag
+                              mechanism. Placeholder shape for forward compat.
+
+  /notebooks:
+    get:
+      summary: Resolve a filesystem path to its notebook URI
+      tags: [lifecycle]
+      x-agentBridge-effect: read
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: URI of the open notebook matching that fsPath
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Ok"
+                  - type: object
+                    properties:
+                      result:
+                        type: object
+                        required: [uri, fsPath]
+                        properties:
+                          uri: { type: string, format: uri }
+                          fsPath: { type: string }
+        "404": { $ref: "#/components/responses/NotebookNotOpen" }
+
+  /notebooks/open:
+    post:
+      summary: Open a marimo notebook (idempotent)
+      tags: [lifecycle]
+      x-agentBridge-effect: mutate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [uri]
+              properties:
+                uri: { type: string, format: uri }
+      responses:
+        "200":
+          description: Notebook is open (now or already)
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Ok"
+                  - type: object
+                    properties:
+                      result:
+                        type: object
+                        required: [uri, alreadyOpen]
+                        properties:
+                          uri: { type: string, format: uri }
+                          alreadyOpen: { type: boolean }
+
+  /notebooks/cells:
+    get:
+      summary: List cells in a notebook
+      tags: [cells]
+      x-agentBridge-effect: read
+      parameters:
+        - $ref: "#/components/parameters/NotebookUriQuery"
+      responses:
+        "200":
+          description: Cell array
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Ok"
+                  - type: object
+                    properties:
+                      result:
+                        type: object
+                        required: [cells]
+                        properties:
+                          cells:
+                            type: array
+                            items: { $ref: "#/components/schemas/Cell" }
+    post:
+      summary: Create a new cell
+      tags: [cells]
+      x-agentBridge-effect: mutate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [notebookUri, code]
+              properties:
+                notebookUri: { type: string, format: uri }
+                code: { type: string }
+                kind: { type: string, enum: [code, markup], default: code }
+                languageId: { type: string }
+                index:
+                  type: integer
+                  description: insertion index; defaults to end of notebook
+      responses:
+        "200":
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Ok"
+                  - type: object
+                    properties:
+                      result:
+                        type: object
+                        required: [index, cellCount]
+                        properties:
+                          index: { type: integer }
+                          cellCount: { type: integer }
+
+  /notebooks/cells/{cellIdx}:
+    patch:
+      summary: Replace the code of a cell
+      tags: [cells]
+      x-agentBridge-effect: mutate
+      parameters:
+        - $ref: "#/components/parameters/CellIdxPath"
+        - $ref: "#/components/parameters/NotebookUriQuery"
+        - $ref: "#/components/parameters/IfMatchHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: { type: string }
+                expectedEtag:
+                  $ref: "#/components/schemas/Etag"
+                  description: Fallback for clients that can't set the `If-Match` header.
+      responses:
+        "200":
+          description: Patched; result includes the NEW etag so callers don't need to GET again
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Ok"
+                  - type: object
+                    properties:
+                      result:
+                        type: object
+                        required: [index, etag]
+                        properties:
+                          index: { type: integer }
+                          etag: { $ref: "#/components/schemas/Etag" }
+        "409": { $ref: "#/components/responses/EtagMismatch" }
+        "404": { $ref: "#/components/responses/NotebookNotOpen" }
+
+    delete:
+      summary: Delete a cell
+      tags: [cells]
+      x-agentBridge-effect: destructive
+      parameters:
+        - $ref: "#/components/parameters/CellIdxPath"
+        - $ref: "#/components/parameters/NotebookUriQuery"
+        - $ref: "#/components/parameters/IfMatchHeader"
+      responses:
+        "200":
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Ok"
+                  - type: object
+                    properties:
+                      result:
+                        type: object
+                        required: [deletedIndex, cellCount]
+                        properties:
+                          deletedIndex: { type: integer }
+                          cellCount: { type: integer }
+        "409": { $ref: "#/components/responses/EtagMismatch" }
+        "404": { $ref: "#/components/responses/NotebookNotOpen" }
+
+  /notebooks/cells/{cellIdx}/run:
+    post:
+      summary: Queue a cell for execution (returns once queued, not when done)
+      tags: [cells]
+      x-agentBridge-effect: run
+      parameters:
+        - $ref: "#/components/parameters/CellIdxPath"
+        - $ref: "#/components/parameters/NotebookUriQuery"
+      responses:
+        "200":
+          description: Queued
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Ok"
+                  - type: object
+                    properties:
+                      result:
+                        type: object
+                        required: [queued]
+                        properties:
+                          queued: { type: integer }
+
+  /notebooks/cells/{cellIdx}/outputs:
+    get:
+      summary: Cell outputs with binary fidelity (base64 for non-text mimes)
+      tags: [cells]
+      x-agentBridge-effect: read
+      parameters:
+        - $ref: "#/components/parameters/CellIdxPath"
+        - $ref: "#/components/parameters/NotebookUriQuery"
+      responses:
+        "200":
+          description: Output items
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Ok"
+                  - type: object
+                    properties:
+                      result:
+                        type: object
+                        required: [cellIdx, outputs]
+                        properties:
+                          cellIdx: { type: integer }
+                          outputs:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                items:
+                                  type: array
+                                  items: { $ref: "#/components/schemas/OutputItem" }
+
+  /events:
+    get:
+      summary: SSE stream of cell mutations (cell-edited / cell-created / cell-deleted)
+      tags: [events]
+      x-agentBridge-effect: watch
+      parameters:
+        - name: notebook
+          in: query
+          required: false
+          schema: { type: string, format: uri }
+          description: |
+            Per-notebook filter. Omit for wildcard mode (all notebooks).
+      responses:
+        "200":
+          description: |
+            Long-lived SSE connection. Events: `hello` (immediate handshake),
+            `cell-edited`, `cell-created`, `cell-deleted`. 15-second `:hb`
+            heartbeats so intermediaries don't drop idle connections.
+            Disconnect cleans up the listener + interval.
+          content:
+            text/event-stream: {}
+
+  /commands/{commandId}:
+    post:
+      summary: Generic VS Code `executeCommand` escape hatch
+      tags: [escape-hatch]
+      x-agentBridge-effect: run
+      description: |
+        Bridge calls `vscode.commands.executeCommand(commandId, ...args)`. Use
+        sparingly — prefer the typed endpoints above when one exists. Exists
+        so test harnesses + sandbox flows can drive any VS Code command
+        without the bridge needing to model every one.
+      parameters:
+        - name: commandId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                args:
+                  type: array
+                  items: {}
+      responses:
+        "200":
+          description: Command executed
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Ok"
+                  - type: object
+                    properties:
+                      result: {}
