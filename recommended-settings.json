@@ -1,0 +1,22 @@
+{
+  "_doc": "Sane defaults for ~/.claude/settings.json — drop the permissions block into your existing settings to skip approving the first 50 bridge tool calls. Read-only and edit-flavoured tools auto-approve; destructive tools always ask.",
+  "permissions": {
+    "allow": [
+      "mcp__agent_bridge__notebook_list_cells",
+      "mcp__agent_bridge__notebook_list_sessions",
+      "mcp__agent_bridge__notebook_cell_outputs",
+      "mcp__agent_bridge__notebook_cell_status",
+      "mcp__agent_bridge__notebook_editor_state",
+      "mcp__agent_bridge__notebook_resolve_path",
+      "mcp__agent_bridge__notebook_edit_cell",
+      "mcp__agent_bridge__notebook_run_cell",
+      "mcp__agent_bridge__notebook_scratchpad_execute"
+    ],
+    "ask": [
+      "mcp__agent_bridge__notebook_open",
+      "mcp__agent_bridge__notebook_create_cell",
+      "mcp__agent_bridge__notebook_delete_cell",
+      "mcp__agent_bridge__notebook_kernel_interrupt"
+    ]
+  }
+}

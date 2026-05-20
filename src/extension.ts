@@ -936,7 +936,7 @@ async function runCell({ nb, cellIdx, res }: CellRouteCtx): Promise<void> {
  * Stdout/stderr channel mimes are explicitly listed here because VS Code uses
  * its own `application/vnd.code.notebook.*` namespace for them — not text/*.
  */
-export function isTextMime(mime: string): boolean {
+function isTextMime(mime: string): boolean {
   return (
     mime.startsWith("text/") ||
     mime === "application/json" ||
@@ -971,7 +971,56 @@ async function cellOutputs({ nb, cellIdx, res }: CellRouteCtx): Promise<void> {
   writeHandlerResult(res, await cellOutputsCore({ nb, cellIdx: cellIdx! }));
 }
 
-export function textDecodeSafe(data: Uint8Array): string {
+/**
+ * Derived cell state from VS Code's executionSummary. NOT marimo's full
+ * reactivity state — "stale" (a cell whose inputs changed) requires marimo's
+ * dependency graph and is intentionally out of scope here.
+ *
+ * Mapping:
+ *   - no executionSummary at all                                   → "idle"
+ *   - success === true (with or without executionOrder)            → "success"
+ *   - success === false (with or without executionOrder)           → "error"
+ *   - executionOrder set, success === undefined (running window)   → "running"
+ *   - executionOrder undefined, success undefined                  → "idle"
+ *
+ * Note: marimo notebooks do not populate executionOrder in VS Code's
+ * executionSummary (marimo manages its own execution model). We therefore
+ * check success first and fall back to executionOrder for the running window.
+ */
+export async function cellStatusCore(args: {
+  nb: vscode.NotebookDocument;
+  cellIdx: number;
+}): Promise<HandlerResult> {
+  const cell = args.nb.cellAt(args.cellIdx);
+  const summary = cell.executionSummary;
+  let status: "idle" | "running" | "success" | "error";
+  if (!summary) {
+    status = "idle";
+  } else if (summary.success === true) {
+    status = "success";
+  } else if (summary.success === false) {
+    status = "error";
+  } else if (summary.executionOrder !== undefined) {
+    // executionOrder is set but success is still undefined → cell is running
+    status = "running";
+  } else {
+    status = "idle";
+  }
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      result: {
+        cellIdx: args.cellIdx,
+        status,
+        executionOrder: summary?.executionOrder ?? null,
+        success: summary?.success ?? null,
+      },
+    },
+  };
+}
+
+function textDecodeSafe(data: Uint8Array): string {
   try {
     return new TextDecoder().decode(data);
   } catch {
@@ -989,7 +1038,7 @@ export function textDecodeSafe(data: Uint8Array): string {
  * in unpaired surrogates could theoretically collide. Tolerated — agents
  * resync via the change-event stream, not the etag space.
  */
-export function cellEtag(code: string): string {
+function cellEtag(code: string): string {
   // FNV-1a 32-bit; 8 hex chars is plenty for in-session diffing.
   let h = 0x811c9dc5;
   for (let i = 0; i < code.length; i++) {

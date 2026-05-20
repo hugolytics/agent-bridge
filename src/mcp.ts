@@ -13,6 +13,7 @@ import {
   deleteCellCore,
   runCellCore,
   cellOutputsCore,
+  cellStatusCore,
   lookupNotebook,
   notebookNotOpenResult,
 } from "./extension";
@@ -145,6 +146,16 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<Mc
         }
       }
       return wrap(result, extras);
+    }
+
+    case "notebook_cell_status": {
+      const r = resolveNb(args.notebookUri);
+      if (!r.ok) return r.result;
+      const idx = args.cellIdx;
+      if (typeof idx !== "number" || idx < 0 || idx >= r.nb.cellCount) {
+        return wrap({ status: 404, body: { ok: false, error: `cell index ${idx} out of bounds` } });
+      }
+      return wrap(await cellStatusCore({ nb: r.nb, cellIdx: idx }));
     }
 
     case "notebook_editor_state": {
@@ -362,7 +373,7 @@ const CELL_IDX_PARAM = {
 const TOOLS: ToolDef[] = [
   {
     name: "notebook_list_cells",
-    description: "List all cells in a notebook with index, code, etag, executionSummary, timing, and outputs.",
+    description: "List all cells in a notebook with index, code, etag, executionSummary, timing, and outputs. NOTE: cell indices are stable only within one round-trip — capture index + etag in the same response you act on. Indices shift on create/delete; etags survive content edits.",
     inputSchema: { type: "object", required: ["notebookUri"], properties: { ...NOTEBOOK_URI_PARAM } },
     annotations: READ,
   },
@@ -373,6 +384,16 @@ const TOOLS: ToolDef[] = [
     annotations: READ,
   },
   {
+    name: "notebook_cell_status",
+    description: "Returns the derived state of a cell from executionSummary: 'idle' (never ran), 'running' (in flight), 'success' (last run succeeded), or 'error' (last run failed). Does NOT include marimo's reactivity-graph 'stale' state.",
+    inputSchema: {
+      type: "object",
+      required: ["notebookUri", "cellIdx"],
+      properties: { ...NOTEBOOK_URI_PARAM, ...CELL_IDX_PARAM },
+    },
+    annotations: READ,
+  },
+  {
     name: "notebook_editor_state",
     description: "Returns selected cell indices, active cell, and cell tags for the active notebook editor.",
     inputSchema: { type: "object", properties: { ...NOTEBOOK_URI_PARAM } },
@@ -380,19 +401,19 @@ const TOOLS: ToolDef[] = [
   },
   {
     name: "notebook_resolve_path",
-    description: "Resolve a filesystem path to its open notebook URI.",
+    description: "Resolve a filesystem path to its open notebook URI. CALL THIS before notebook_open if you have a path and want to know whether it's already open.",
     inputSchema: { type: "object", required: ["path"], properties: { path: { type: "string" } } },
     annotations: READ,
   },
   {
     name: "notebook_list_sessions",
-    description: "List active marimo notebook sessions (marimo-pair compatible). Returns a map of notebookUri to {filename}.",
+    description: "List active marimo notebook sessions (marimo-pair compatible). Returns a map of notebookUri to {filename}. CALL THIS FIRST before notebook_open to avoid spawning duplicate sessions on the same file.",
     inputSchema: { type: "object", properties: {} },
     annotations: READ,
   },
   {
     name: "notebook_open",
-    description: "Open a marimo notebook. Idempotent: returns alreadyOpen=true if the notebook is already open.",
+    description: "Open a marimo notebook. Idempotent — safe to call even if the notebook is already open; the response's result.alreadyOpen tells you which path was taken. Prefer calling notebook_list_sessions / notebook_resolve_path first to skip the call entirely when possible.",
     inputSchema: { type: "object", required: ["uri"], properties: { uri: { type: "string", format: "uri" } } },
     annotations: MUTATE_IDEMPOTENT,
   },
