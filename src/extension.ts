@@ -26,6 +26,16 @@ interface MarimoKernel {
 }
 
 /**
+ * Pure-function handler return type. Lets both HTTP and MCP transports
+ * reuse the same internal logic — HTTP writes `body` as JSON with the
+ * given `status`; MCP wraps `body` as content + maps non-200 to MCP error.
+ */
+interface HandlerResult {
+  status: number;
+  body: Record<string, unknown>;
+}
+
+/**
  * Agent Bridge — a localhost HTTP server inside VS Code that lets external
  * agents (Claude Code CLI, MCP servers, scripts) drive marimo notebooks open
  * in the VS Code marimo extension, with the same kernel state the user sees.
@@ -649,6 +659,10 @@ function writeJson(res: http.ServerResponse, status: number, payload: unknown): 
   res.end(JSON.stringify(payload));
 }
 
+function writeHandlerResult(res: http.ServerResponse, r: HandlerResult): void {
+  writeJson(res, r.status, r.body);
+}
+
 interface CellRouteCtx {
   nb: vscode.NotebookDocument;
   body: any;
@@ -675,20 +689,13 @@ function matchCellRoute(method: string, pathname: string): CellRoute | null {
   return null;
 }
 
-async function listCells({ nb, res }: CellRouteCtx): Promise<void> {
+function listCellsCore(nb: vscode.NotebookDocument): HandlerResult {
   const cells = nb.getCells().map((c, i) => {
-    const summary = c.executionSummary;
     const code = c.document.getText();
-    // VS Code's executionSummary.timing is {startTime, endTime} in ms since
-    // epoch when the cell has run. duration_ms is the obvious derivative — we
-    // compute it here so agents reasoning about "how much work is in flight"
-    // or "what's stale" don't have to.
+    const summary = c.executionSummary;
     const timing = summary?.timing
-      ? {
-          startTime: summary.timing.startTime,
-          endTime: summary.timing.endTime,
-          duration_ms: summary.timing.endTime - summary.timing.startTime,
-        }
+      ? { startTime: summary.timing.startTime, endTime: summary.timing.endTime,
+          duration_ms: summary.timing.endTime - summary.timing.startTime }
       : null;
     return {
       index: i,
@@ -697,10 +704,7 @@ async function listCells({ nb, res }: CellRouteCtx): Promise<void> {
       code,
       etag: cellEtag(code),
       executionSummary: summary
-        ? {
-            success: summary.success,
-            executionOrder: summary.executionOrder,
-          }
+        ? { success: summary.success, executionOrder: summary.executionOrder }
         : null,
       timing,
       outputs: c.outputs.map((o) => ({
@@ -708,7 +712,35 @@ async function listCells({ nb, res }: CellRouteCtx): Promise<void> {
       })),
     };
   });
-  writeJson(res, 200, { ok: true, result: { cells } });
+  return { status: 200, body: { ok: true, result: { cells } } };
+}
+
+async function listCells({ nb, res }: CellRouteCtx): Promise<void> {
+  writeHandlerResult(res, listCellsCore(nb));
+}
+
+async function createCellCore(args: {
+  nb: vscode.NotebookDocument;
+  code: string;
+  kind?: "code" | "markup";
+  languageId?: string;
+  index?: number;
+}): Promise<HandlerResult> {
+  const kind =
+    args.kind === "markup" ? vscode.NotebookCellKind.Markup : vscode.NotebookCellKind.Code;
+  const isMarimo = args.nb.notebookType === "marimo-notebook";
+  const lang =
+    args.languageId ??
+    (kind === vscode.NotebookCellKind.Code ? (isMarimo ? "mo-python" : "python") : "markdown");
+  const idx = typeof args.index === "number" ? args.index : args.nb.cellCount;
+  const edit = new vscode.WorkspaceEdit();
+  edit.set(args.nb.uri, [
+    vscode.NotebookEdit.insertCells(idx, [
+      new vscode.NotebookCellData(kind, args.code, lang),
+    ]),
+  ]);
+  const ok = await vscode.workspace.applyEdit(edit);
+  return { status: 200, body: { ok, result: { index: idx, cellCount: args.nb.cellCount } } };
 }
 
 async function createCell({ nb, body, res }: CellRouteCtx): Promise<void> {
@@ -716,24 +748,47 @@ async function createCell({ nb, body, res }: CellRouteCtx): Promise<void> {
     writeJson(res, 400, { ok: false, error: "missing body.code (string)" });
     return;
   }
-  const kind =
-    body.kind === "markup" ? vscode.NotebookCellKind.Markup : vscode.NotebookCellKind.Code;
-  // Default code cell language to "mo-python" (marimo's custom Python id)
-  // for marimo notebooks. Without this, marimo's NotebookController doesn't
-  // own the cell and run-cell silently no-ops.
-  const isMarimo = nb.notebookType === "marimo-notebook";
-  const lang =
-    body.languageId ??
-    (kind === vscode.NotebookCellKind.Code ? (isMarimo ? "mo-python" : "python") : "markdown");
-  const idx = typeof body.index === "number" ? body.index : nb.cellCount;
+  writeHandlerResult(res, await createCellCore({
+    nb,
+    code: body.code,
+    kind: body.kind,
+    languageId: body.languageId,
+    index: typeof body.index === "number" ? body.index : undefined,
+  }));
+}
+
+async function editCellCore(args: {
+  nb: vscode.NotebookDocument;
+  cellIdx: number;
+  code: string;
+  ifMatch?: string;
+}): Promise<HandlerResult> {
+  const cell = args.nb.cellAt(args.cellIdx);
+  const currentEtag = cellEtag(cell.document.getText());
+  // `!== undefined` (not truthiness) so an etag like "00000000" still triggers
+  // the check — matches the live editCell handler's semantics exactly.
+  if (args.ifMatch !== undefined && args.ifMatch !== currentEtag) {
+    return {
+      status: 409,
+      body: {
+        ok: false,
+        error: "etag mismatch — cell changed since you read it",
+        currentEtag,
+        providedEtag: args.ifMatch,
+      },
+    };
+  }
+  const range = new vscode.Range(
+    cell.document.positionAt(0),
+    cell.document.positionAt(cell.document.getText().length),
+  );
   const edit = new vscode.WorkspaceEdit();
-  edit.set(nb.uri, [
-    vscode.NotebookEdit.insertCells(idx, [
-      new vscode.NotebookCellData(kind, body.code, lang),
-    ]),
-  ]);
+  edit.replace(cell.document.uri, range, args.code);
   const ok = await vscode.workspace.applyEdit(edit);
-  writeJson(res, 200, { ok, result: { index: idx, cellCount: nb.cellCount } });
+  return {
+    status: 200,
+    body: { ok, result: { index: args.cellIdx, etag: cellEtag(args.code) } },
+  };
 }
 
 async function editCell({ nb, body, cellIdx, res, ifMatch }: CellRouteCtx): Promise<void> {
@@ -741,57 +796,65 @@ async function editCell({ nb, body, cellIdx, res, ifMatch }: CellRouteCtx): Prom
     writeJson(res, 400, { ok: false, error: "missing body.code (string) — refusing to wipe cell" });
     return;
   }
-  const cell = nb.cellAt(cellIdx!);
-  const currentEtag = cellEtag(cell.document.getText());
-  if (ifMatch !== undefined && ifMatch !== currentEtag) {
-    writeJson(res, 409, {
-      ok: false,
-      error: "etag mismatch — cell changed since you read it",
-      currentEtag,
-      providedEtag: ifMatch,
-    });
-    return;
-  }
-  const range = new vscode.Range(
-    cell.document.positionAt(0),
-    cell.document.positionAt(cell.document.getText().length),
-  );
-  const edit = new vscode.WorkspaceEdit();
-  edit.replace(cell.document.uri, range, body.code);
-  const ok = await vscode.workspace.applyEdit(edit);
-  writeJson(res, 200, { ok, result: { index: cellIdx, etag: cellEtag(body.code) } });
+  writeHandlerResult(res, await editCellCore({
+    nb,
+    cellIdx: cellIdx!,
+    code: body.code,
+    ifMatch,
+  }));
 }
 
-async function deleteCell({ nb, cellIdx, res, ifMatch }: CellRouteCtx): Promise<void> {
-  if (ifMatch !== undefined) {
-    const cell = nb.cellAt(cellIdx!);
-    const currentEtag = cellEtag(cell.document.getText());
-    if (ifMatch !== currentEtag) {
-      writeJson(res, 409, {
+async function deleteCellCore(args: {
+  nb: vscode.NotebookDocument;
+  cellIdx: number;
+  ifMatch?: string;
+}): Promise<HandlerResult> {
+  const cell = args.nb.cellAt(args.cellIdx);
+  const currentEtag = cellEtag(cell.document.getText());
+  // `!== undefined` matches the live deleteCell handler.
+  if (args.ifMatch !== undefined && args.ifMatch !== currentEtag) {
+    return {
+      status: 409,
+      body: {
         ok: false,
         error: "etag mismatch — cell changed since you read it",
         currentEtag,
-        providedEtag: ifMatch,
-      });
-      return;
-    }
+        providedEtag: args.ifMatch,
+      },
+    };
   }
   const edit = new vscode.WorkspaceEdit();
-  edit.set(nb.uri, [
-    vscode.NotebookEdit.deleteCells(
-      new vscode.NotebookRange(cellIdx!, cellIdx! + 1),
-    ),
+  edit.set(args.nb.uri, [
+    vscode.NotebookEdit.deleteCells(new vscode.NotebookRange(args.cellIdx, args.cellIdx + 1)),
   ]);
   const ok = await vscode.workspace.applyEdit(edit);
-  writeJson(res, 200, { ok, result: { deletedIndex: cellIdx, cellCount: nb.cellCount } });
+  return {
+    status: 200,
+    body: { ok, result: { deletedIndex: args.cellIdx, cellCount: args.nb.cellCount } },
+  };
+}
+
+async function deleteCell({ nb, cellIdx, res, ifMatch }: CellRouteCtx): Promise<void> {
+  writeHandlerResult(res, await deleteCellCore({
+    nb,
+    cellIdx: cellIdx!,
+    ifMatch,
+  }));
+}
+
+async function runCellCore(args: {
+  nb: vscode.NotebookDocument;
+  cellIdx: number;
+}): Promise<HandlerResult> {
+  await vscode.commands.executeCommand("notebook.cell.execute", {
+    ranges: [{ start: args.cellIdx, end: args.cellIdx + 1 }],
+    document: args.nb.uri,
+  });
+  return { status: 200, body: { ok: true, result: { queued: args.cellIdx } } };
 }
 
 async function runCell({ nb, cellIdx, res }: CellRouteCtx): Promise<void> {
-  await vscode.commands.executeCommand("notebook.cell.execute", {
-    ranges: [{ start: cellIdx!, end: cellIdx! + 1 }],
-    document: nb.uri,
-  });
-  writeJson(res, 200, { ok: true, result: { queued: cellIdx } });
+  writeHandlerResult(res, await runCellCore({ nb, cellIdx: cellIdx! }));
 }
 
 /**
@@ -811,19 +874,28 @@ function isTextMime(mime: string): boolean {
   );
 }
 
-async function cellOutputs({ nb, cellIdx, res }: CellRouteCtx): Promise<void> {
-  const cell = nb.cellAt(cellIdx!);
+async function cellOutputsCore(args: {
+  nb: vscode.NotebookDocument;
+  cellIdx: number;
+}): Promise<HandlerResult> {
+  const cell = args.nb.cellAt(args.cellIdx);
   const outputs = cell.outputs.map((o) => ({
     items: o.items.map((it) => {
       const b64 = Buffer.from(it.data).toString("base64");
       if (isTextMime(it.mime)) {
-        // Include BOTH for stdout-as-bytes round-tripping.
         return { mime: it.mime, data: textDecodeSafe(it.data), data_b64: b64 };
       }
       return { mime: it.mime, data_b64: b64 };
     }),
   }));
-  writeJson(res, 200, { ok: true, result: { cellIdx, outputs } });
+  return {
+    status: 200,
+    body: { ok: true, result: { cellIdx: args.cellIdx, outputs } },
+  };
+}
+
+async function cellOutputs({ nb, cellIdx, res }: CellRouteCtx): Promise<void> {
+  writeHandlerResult(res, await cellOutputsCore({ nb, cellIdx: cellIdx! }));
 }
 
 function textDecodeSafe(data: Uint8Array): string {
