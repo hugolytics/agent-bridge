@@ -219,10 +219,17 @@ function listenAndAnnounce(
     }
     out.appendLine(`listening on http://127.0.0.1:${port}`);
 
-    // Per-workspace .claude/.mcp.json for Claude Code's auto-discovery.
-    // Written to the first workspace folder. When VS Code opens a single
-    // file (no workspace folder yet), we defer the write until a workspace
-    // folder or marimo notebook appears. Cleanup on dispose regardless.
+    // Per-workspace .mcp.json for Claude Code's project-scoped MCP
+    // auto-discovery. Claude Code reads <workspace>/.mcp.json (not
+    // <workspace>/.claude/.mcp.json — the .claude/ subdir holds settings.json
+    // and skills, not MCP config), and expects the shape
+    // {"mcpServers": {"<name>": {...}}} (not a flat name→config map).
+    // Verified end-to-end: with the correct path+shape Claude Code reports
+    // "agent-bridge: http://...:N/mcp (HTTP) - ✓ Connected" via `claude mcp list`.
+    //
+    // When VS Code opens a single file (no workspace folder yet), we defer
+    // the write until a workspace folder or marimo notebook appears.
+    // Cleanup on dispose regardless.
     let mcpDiscoveryPath: string | undefined;
     const mcpEntry: Record<string, unknown> = {
       type: "http",
@@ -231,11 +238,15 @@ function listenAndAnnounce(
     if (token) {
       mcpEntry.headers = { Authorization: `Bearer ${token}` };
     }
-    const mcpPayload = JSON.stringify({ "agent-bridge": mcpEntry }, null, 2);
+    const mcpPayload = JSON.stringify(
+      { mcpServers: { "agent-bridge": mcpEntry } },
+      null,
+      2,
+    );
 
     const writeMcpDiscovery = (dir: string) => {
       if (mcpDiscoveryPath) return; // already written
-      const p = path.join(dir, ".claude", ".mcp.json");
+      const p = path.join(dir, ".mcp.json");
       try {
         fs.mkdirSync(path.dirname(p), { recursive: true });
         fs.writeFileSync(p, mcpPayload);
