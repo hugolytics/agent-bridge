@@ -4,6 +4,7 @@ import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
+import { handleMcpRequest } from "./mcp";
 
 type BridgeEvent =
   | { kind: "cell-edited"; notebookUri: string; cellIdx: number; code: string; etag: string; ts: number }
@@ -218,6 +219,66 @@ function listenAndAnnounce(
     }
     out.appendLine(`listening on http://127.0.0.1:${port}`);
 
+    // Per-workspace .claude/.mcp.json for Claude Code's auto-discovery.
+    // Written to the first workspace folder. When VS Code opens a single
+    // file (no workspace folder yet), we defer the write until a workspace
+    // folder or marimo notebook appears. Cleanup on dispose regardless.
+    let mcpDiscoveryPath: string | undefined;
+    const mcpEntry: Record<string, unknown> = {
+      type: "http",
+      url: `http://127.0.0.1:${port}/mcp`,
+    };
+    if (token) {
+      mcpEntry.headers = { Authorization: `Bearer ${token}` };
+    }
+    const mcpPayload = JSON.stringify({ "agent-bridge": mcpEntry }, null, 2);
+
+    const writeMcpDiscovery = (dir: string) => {
+      if (mcpDiscoveryPath) return; // already written
+      const p = path.join(dir, ".claude", ".mcp.json");
+      try {
+        fs.mkdirSync(path.dirname(p), { recursive: true });
+        fs.writeFileSync(p, mcpPayload);
+        mcpDiscoveryPath = p;
+        out.appendLine(`mcp discovery: ${p}`);
+      } catch (err) {
+        out.appendLine(`mcp discovery write failed: ${err}`);
+      }
+    };
+
+    // Try workspace folder immediately.
+    const wsNow = vscode.workspace.workspaceFolders?.[0];
+    if (wsNow) {
+      writeMcpDiscovery(wsNow.uri.fsPath);
+    }
+
+    // If no workspace folder yet, watch for one (file-only launch) or fall
+    // back to the first marimo notebook's parent dir when it opens.
+    if (!mcpDiscoveryPath) {
+      const wsSub = vscode.workspace.onDidChangeWorkspaceFolders((e) => {
+        const added = e.added[0];
+        if (added) writeMcpDiscovery(added.uri.fsPath);
+      });
+      ctx.subscriptions.push(wsSub);
+
+      const nbSub = vscode.workspace.onDidOpenNotebookDocument((nb) => {
+        writeMcpDiscovery(path.dirname(nb.uri.fsPath));
+      });
+      ctx.subscriptions.push(nbSub);
+
+      // Also check notebooks already open (e.g. eagerStart with notebook open).
+      const nbNow = vscode.workspace.notebookDocuments[0];
+      if (nbNow) writeMcpDiscovery(path.dirname(nbNow.uri.fsPath));
+    }
+
+    ctx.subscriptions.push({
+      dispose() {
+        if (mcpDiscoveryPath) {
+          try { fs.unlinkSync(mcpDiscoveryPath); } catch { /* ignore */ }
+        }
+      },
+    });
+
     // marimo-pair compatibility: register this bridge in the same local
     // server registry that marimo-pair's discover-servers.sh reads. The
     // registry file format mirrors what `marimo edit` writes — fields:
@@ -308,6 +369,18 @@ async function handle(
       port: (req.socket.address() as { port: number }).port,
       vscodeVersion: vscode.version,
     });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/mcp") {
+    const body = await readJson(req).catch(() => null);
+    const resp = await handleMcpRequest(body);
+    if (resp === null) {
+      res.statusCode = 204;
+      res.end();
+    } else {
+      writeJson(res, 200, resp);
+    }
     return;
   }
 
