@@ -31,7 +31,7 @@ interface MarimoKernel {
  * reuse the same internal logic — HTTP writes `body` as JSON with the
  * given `status`; MCP wraps `body` as content + maps non-200 to MCP error.
  */
-interface HandlerResult {
+export interface HandlerResult {
   status: number;
   body: Record<string, unknown>;
 }
@@ -762,7 +762,7 @@ function matchCellRoute(method: string, pathname: string): CellRoute | null {
   return null;
 }
 
-function listCellsCore(nb: vscode.NotebookDocument): HandlerResult {
+export function listCellsCore(nb: vscode.NotebookDocument): HandlerResult {
   const cells = nb.getCells().map((c, i) => {
     const code = c.document.getText();
     const summary = c.executionSummary;
@@ -792,7 +792,7 @@ async function listCells({ nb, res }: CellRouteCtx): Promise<void> {
   writeHandlerResult(res, listCellsCore(nb));
 }
 
-async function createCellCore(args: {
+export async function createCellCore(args: {
   nb: vscode.NotebookDocument;
   code: string;
   kind?: "code" | "markup";
@@ -830,7 +830,7 @@ async function createCell({ nb, body, res }: CellRouteCtx): Promise<void> {
   }));
 }
 
-async function editCellCore(args: {
+export async function editCellCore(args: {
   nb: vscode.NotebookDocument;
   cellIdx: number;
   code: string;
@@ -877,7 +877,7 @@ async function editCell({ nb, body, cellIdx, res, ifMatch }: CellRouteCtx): Prom
   }));
 }
 
-async function deleteCellCore(args: {
+export async function deleteCellCore(args: {
   nb: vscode.NotebookDocument;
   cellIdx: number;
   ifMatch?: string;
@@ -915,7 +915,7 @@ async function deleteCell({ nb, cellIdx, res, ifMatch }: CellRouteCtx): Promise<
   }));
 }
 
-async function runCellCore(args: {
+export async function runCellCore(args: {
   nb: vscode.NotebookDocument;
   cellIdx: number;
 }): Promise<HandlerResult> {
@@ -936,7 +936,7 @@ async function runCell({ nb, cellIdx, res }: CellRouteCtx): Promise<void> {
  * Stdout/stderr channel mimes are explicitly listed here because VS Code uses
  * its own `application/vnd.code.notebook.*` namespace for them — not text/*.
  */
-function isTextMime(mime: string): boolean {
+export function isTextMime(mime: string): boolean {
   return (
     mime.startsWith("text/") ||
     mime === "application/json" ||
@@ -947,7 +947,7 @@ function isTextMime(mime: string): boolean {
   );
 }
 
-async function cellOutputsCore(args: {
+export async function cellOutputsCore(args: {
   nb: vscode.NotebookDocument;
   cellIdx: number;
 }): Promise<HandlerResult> {
@@ -971,7 +971,7 @@ async function cellOutputs({ nb, cellIdx, res }: CellRouteCtx): Promise<void> {
   writeHandlerResult(res, await cellOutputsCore({ nb, cellIdx: cellIdx! }));
 }
 
-function textDecodeSafe(data: Uint8Array): string {
+export function textDecodeSafe(data: Uint8Array): string {
   try {
     return new TextDecoder().decode(data);
   } catch {
@@ -989,7 +989,7 @@ function textDecodeSafe(data: Uint8Array): string {
  * in unpaired surrogates could theoretically collide. Tolerated — agents
  * resync via the change-event stream, not the etag space.
  */
-function cellEtag(code: string): string {
+export function cellEtag(code: string): string {
   // FNV-1a 32-bit; 8 hex chars is plenty for in-session diffing.
   let h = 0x811c9dc5;
   for (let i = 0; i < code.length; i++) {
@@ -997,6 +997,21 @@ function cellEtag(code: string): string {
     h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
   }
   return h.toString(16).padStart(8, "0");
+}
+
+export function lookupNotebook(uri: string): vscode.NotebookDocument | undefined {
+  return vscode.workspace.notebookDocuments.find((n) => n.uri.toString() === uri);
+}
+
+export function notebookNotOpenResult(uri: string): HandlerResult {
+  return {
+    status: 404,
+    body: {
+      ok: false,
+      error: `notebook not open: ${uri}`,
+      openNotebooks: vscode.workspace.notebookDocuments.map((n) => n.uri.toString()),
+    },
+  };
 }
 
 async function readJson(req: http.IncomingMessage): Promise<any> {
